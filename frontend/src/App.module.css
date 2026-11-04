@@ -1373,17 +1373,208 @@
 .projectsGrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 16px;
+  gap: 20px;
 }
 
 .projectCard {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.projectCard:hover {
+  border-color: var(--border-strong);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  transform: translateY(-2px);
+}
+
+.projectThumbnailWrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #090B0E;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid var(--border);
+}
+
+.projectThumbnailImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.3s ease;
+}
+
+.projectThumbnailWrap:hover .projectThumbnailImg {
+  transform: scale(1.04);
+}
+
+.projectThumbnailFallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #141721 0%, #1A1F2C 100%);
+}
+
+.projectStatusBadge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(18, 21, 28, 0.85);
+  backdrop-filter: blur(8px);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  z-index: 2;
+}
+
+.statusBadge_done {
+  background: rgba(34, 197, 94, 0.2);
+  border-color: rgba(34, 197, 94, 0.5);
+  color: #86EFAC;
+}
+
+.statusBadge_running {
+  background: rgba(56, 189, 248, 0.2);
+  border-color: rgba(56, 189, 248, 0.5);
+  color: #7DD3FC;
+}
+
+.statusBadge_paused {
+  background: rgba(245, 181, 10, 0.2);
+  border-color: rgba(245, 181, 10, 0.5);
+  color: #FCD34D;
+}
+
+.statusBadge_failed {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #FCA5A5;
+}
+
+.projectDurationBadge {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.78);
+  backdrop-filter: blur(4px);
+  color: #fff;
+  z-index: 2;
+}
+
+.projectOrientationBadge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(4px);
+  color: var(--text-muted);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  z-index: 2;
+}
+
+.projectInfo {
+  padding: 14px 16px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.projectTitle {
+  font-weight: 700;
+  color: #fff;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.projectTitle:hover {
+  color: var(--primary);
+}
+
+.projectTimestampRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
+  color: var(--accent-amber);
+  background: rgba(245, 181, 10, 0.08);
+  border: 1px solid rgba(245, 181, 10, 0.22);
+  padding: 4px 9px;
+  border-radius: 6px;
+  width: fit-content;
+}
+
+.timestampIcon {
+  color: var(--accent-amber);
+  flex-shrink: 0;
+}
+
+.projectMetaRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--text-faint);
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.projectActionsRow {
+  padding: 8px 16px 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+
+.openProjectBtn {
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  color: #93C5FD;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.openProjectBtn:hover {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
 .settingsCard {

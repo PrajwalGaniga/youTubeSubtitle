@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from ass_generator import PRESETS
 from config import FFMPEG_PATH, FFPROBE_PATH, GEMINI_API_KEY, GEMINI_MODEL, JOBS_DIR, MAX_UPLOAD_BYTES
-from video_burner import reformat_video_aspect
+from video_burner import extract_video_thumbnail, reformat_video_aspect
 from job_manager import (
     attach_background_music,
     cancel_job_execution,
@@ -194,8 +194,12 @@ async def create_and_start_job(
             job["status"] = "running"
             log_job(job_id, "upload", f"Upload completed ({job['input']['size_mb']} MB). Starting pipeline.")
 
-        # Kick off background execution
+        # Kick off background execution and thumbnail extraction
         asyncio.create_task(execute_job(job_id))
+        try:
+            asyncio.create_task(asyncio.to_thread(extract_video_thumbnail, str(input_path), str(job_dir / "thumbnail.jpg")))
+        except Exception:
+            pass
         return {"job_id": job_id, "status": "running"}
 
     except Exception as exc:
@@ -469,6 +473,7 @@ async def download_job_file(job_id: str, filename: str):
         "final_output.mp4": job_dir / "final_output.mp4",
         f"{base_name}_sub.mp4": job_dir / "final_output.mp4",
         "input.mp4": job_dir / "input.mp4",
+        "thumbnail.jpg": job_dir / "thumbnail.jpg",
         "cleaned_audio.wav": job_dir / "clean_audio.wav",
         "clean_audio.wav": job_dir / "clean_audio.wav",
         "extracted_audio.wav": job_dir / "extracted_audio.wav",
@@ -511,6 +516,9 @@ async def download_job_file(job_id: str, filename: str):
         ".txt": "text/plain",
         ".json": "application/json",
         ".zip": "application/zip",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
     }
     ext = os.path.splitext(filename)[1].lower()
     media_type = media_types.get(ext, "application/octet-stream")
@@ -519,6 +527,34 @@ async def download_job_file(job_id: str, filename: str):
         path=str(target),
         media_type=media_type,
         filename=download_filename,
+    )
+
+
+@app.get("/api/jobs/{job_id}/thumbnail", tags=["projects"])
+async def get_job_thumbnail(job_id: str):
+    """
+    Return video preview thumbnail (first frame).
+    Generates on-demand if missing from disk.
+    """
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    thumb_path = job_dir / "thumbnail.jpg"
+    if not thumb_path.exists() or thumb_path.stat().st_size == 0:
+        input_video = job_dir / "input.mp4"
+        if input_video.exists() and input_video.stat().st_size > 0:
+            ok = await asyncio.to_thread(extract_video_thumbnail, str(input_video), str(thumb_path))
+            if not ok or not thumb_path.exists():
+                raise HTTPException(status_code=404, detail="Could not extract video thumbnail.")
+        else:
+            raise HTTPException(status_code=404, detail="Input video not found for thumbnail.")
+
+    return FileResponse(
+        path=str(thumb_path),
+        media_type="image/jpeg",
+        filename=f"thumb_{job_id}.jpg",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

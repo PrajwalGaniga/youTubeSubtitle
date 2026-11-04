@@ -122,6 +122,27 @@ function fmtSec(sec) {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
+function formatIST(isoString) {
+  if (!isoString) return ''
+  try {
+    const d = new Date(isoString)
+    if (isNaN(d.getTime())) return isoString
+    return (
+      d.toLocaleString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      }) + ' IST'
+    )
+  } catch {
+    return isoString
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main Application Component
 // ---------------------------------------------------------------------------
@@ -1935,49 +1956,128 @@ export default function App() {
               </div>
             ) : (
               <div className={styles.projectsGrid}>
-                {projects.map((p) => (
-                  <div key={p.job_id} className={styles.projectCard}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span style={{ fontWeight: 700, color: '#fff' }}>{p.name}</span>
-                      <span className={styles.pill}>{p.status}</span>
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-faint)' }}>
-                      Preset: {p.preset} • Size: {p.size_mb} MB • Duration: {p.duration_s}s
-                    </div>
-                    <div style={{ display: 'flex', gap: 10, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                      <button
-                        type="button"
-                        className={styles.secondaryBtn}
-                        style={{ padding: '6px 12px', fontSize: '0.78rem' }}
+                {projects.map((p) => {
+                  const uploadTimeIST = p.created_at_ist || formatIST(p.created_at)
+                  const thumbUrl = p.thumbnail_url || `/api/jobs/${p.job_id}/thumbnail`
+
+                  return (
+                    <div key={p.job_id} className={styles.projectCard}>
+                      {/* Video Thumbnail (First Frame Preview) */}
+                      <div
+                        className={styles.projectThumbnailWrap}
                         onClick={() => {
                           localStorage.setItem('ytsub_active_job', p.job_id)
                           setActiveJobId(p.job_id)
                           setActiveTab('studio')
                         }}
+                        title="Click to open this video in Studio"
                       >
-                        Open in Studio
-                      </button>
-                      {p.status === 'done' && (
+                        <img
+                          src={thumbUrl}
+                          alt={p.name}
+                          className={styles.projectThumbnailImg}
+                          loading="lazy"
+                          onError={(e) => {
+                            e.currentTarget.style.display = 'none'
+                            const fb = e.currentTarget.parentElement?.querySelector(`.${styles.projectThumbnailFallback}`)
+                            if (fb) fb.style.display = 'flex'
+                          }}
+                        />
+                        <div className={styles.projectThumbnailFallback} style={{ display: 'none' }}>
+                          <Film size={32} />
+                          <span style={{ fontSize: '0.72rem', marginTop: 4 }}>Video Preview</span>
+                        </div>
+
+                        {/* Overlay Status Badge */}
+                        <span className={`${styles.projectStatusBadge} ${styles['statusBadge_' + p.status] || ''}`}>
+                          {p.status}
+                        </span>
+
+                        {/* Duration Badge */}
+                        {p.duration_s > 0 && (
+                          <span className={styles.projectDurationBadge}>
+                            {fmtSec(p.duration_s)}
+                          </span>
+                        )}
+
+                        {/* Orientation Badge */}
+                        {p.orientation && (
+                          <span className={styles.projectOrientationBadge}>
+                            {p.orientation === 'portrait' ? '9:16 Shorts' : '16:9 Landscape'}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Video Information Header */}
+                      <div className={styles.projectInfo}>
+                        <div
+                          className={styles.projectTitle}
+                          title={p.name}
+                          onClick={() => {
+                            localStorage.setItem('ytsub_active_job', p.job_id)
+                            setActiveJobId(p.job_id)
+                            setActiveTab('studio')
+                          }}
+                        >
+                          {p.name}
+                        </div>
+
+                        {/* Indian Standard Time (IST) Upload Timestamp */}
+                        <div className={styles.projectTimestampRow} title={`Uploaded at ${uploadTimeIST}`}>
+                          <Clock size={12} className={styles.timestampIcon} />
+                          <span>Uploaded: <strong style={{ color: '#E2E8F0', fontWeight: 600 }}>{uploadTimeIST}</strong></span>
+                        </div>
+
+                        <div className={styles.projectMetaRow}>
+                          <span>Preset: <strong style={{ color: '#CBD5E1' }}>{p.preset}</strong></span>
+                          <span>•</span>
+                          <span>{p.size_mb} MB</span>
+                          {p.voice && (
+                            <>
+                              <span>•</span>
+                              <span>Voice: {p.voice}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Project Actions */}
+                      <div className={styles.projectActionsRow}>
                         <button
                           type="button"
-                          className={styles.secondaryBtn}
-                          style={{ padding: '6px 12px', fontSize: '0.78rem' }}
-                          onClick={() => openFormatModal(p)}
+                          className={styles.openProjectBtn}
+                          onClick={() => {
+                            localStorage.setItem('ytsub_active_job', p.job_id)
+                            setActiveJobId(p.job_id)
+                            setActiveTab('studio')
+                          }}
+                          title="Open in Studio for subtitle editing, audio tuning, and export"
                         >
-                          <Download size={13} /> Export Format
+                          Open in Studio
                         </button>
-                      )}
-                      <button
-                        type="button"
-                        className={styles.deleteCardBtn}
-                        onClick={(e) => handleDeleteProject(p.job_id, p.name, e)}
-                        title="Permanently delete project and purge disk files"
-                      >
-                        <Trash2 size={13} /> Delete
-                      </button>
+                        {p.status === 'done' && (
+                          <button
+                            type="button"
+                            className={styles.secondaryBtn}
+                            style={{ padding: '6px 11px', fontSize: '0.78rem' }}
+                            onClick={() => openFormatModal(p)}
+                            title="Export in 9:16 Shorts or 16:9 Landscape format"
+                          >
+                            <Download size={13} /> Export Format
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className={styles.deleteCardBtn}
+                          onClick={(e) => handleDeleteProject(p.job_id, p.name, e)}
+                          title="Permanently delete project and purge disk files"
+                        >
+                          <Trash2 size={13} /> Delete
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>

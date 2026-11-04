@@ -89,6 +89,60 @@ def probe_video_duration(video_path: str) -> float:
         return 60.0
 
 
+def extract_video_thumbnail(video_path: str, thumbnail_path: str) -> bool:
+    """
+    Extract a high quality first frame preview thumbnail from video_path.
+    Uses 0.5s offset to avoid initial black frames, falling back to 0.0s.
+    Scales down max width to 640px for fast web display.
+    """
+    video_path_str = str(video_path)
+    thumbnail_path_str = str(thumbnail_path)
+
+    os.makedirs(os.path.dirname(os.path.abspath(thumbnail_path_str)), exist_ok=True)
+
+    # Attempt at 0.5s
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-nostdin",
+        "-loglevel", "error",
+        "-ss", "00:00:00.500",
+        "-i", video_path_str,
+        "-vframes", "1",
+        "-vf", "scale=min(640\\,iw):-2",
+        "-q:v", "2",
+        "-update", "1",
+        thumbnail_path_str,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True, stdin=subprocess.DEVNULL)
+        if os.path.exists(thumbnail_path_str) and os.path.getsize(thumbnail_path_str) > 0:
+            return True
+    except Exception:
+        pass
+
+    # Fallback to 0.0s (start frame)
+    cmd_fb = [
+        FFMPEG_PATH,
+        "-y",
+        "-nostdin",
+        "-loglevel", "error",
+        "-ss", "00:00:00.000",
+        "-i", video_path_str,
+        "-vframes", "1",
+        "-vf", "scale=min(640\\,iw):-2",
+        "-q:v", "2",
+        "-update", "1",
+        thumbnail_path_str,
+    ]
+    try:
+        subprocess.run(cmd_fb, capture_output=True, check=True, stdin=subprocess.DEVNULL)
+        return os.path.exists(thumbnail_path_str) and os.path.getsize(thumbnail_path_str) > 0
+    except Exception as e:
+        print(f"[video_burner] Failed to extract thumbnail: {e}")
+        return False
+
+
 def burn_subtitles(
     temp_dir: str,
     preset_id: str = "hormozi-yellow",

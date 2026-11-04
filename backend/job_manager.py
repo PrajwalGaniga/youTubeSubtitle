@@ -30,12 +30,31 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 from audio_processor import clean_audio, extract_audio
 from config import FFMPEG_PATH, FFPROBE_PATH, GEMINI_API_KEY, GEMINI_MODEL, JOBS_DIR, MAX_UPLOAD_BYTES
 from transcriber import transcribe
-from video_burner import burn_subtitles, mix_background_music, mux_clean_audio_only, probe_video_dimensions, probe_video_duration
+from video_burner import burn_subtitles, extract_video_thumbnail, mix_background_music, mux_clean_audio_only, probe_video_dimensions, probe_video_duration
 
 # In-memory registry of active and historical jobs
 _JOBS: Dict[str, Dict[str, Any]] = {}
 _EVENT_LISTENERS: Dict[str, List[asyncio.Queue]] = {}
 _ACTIVE_SUBPROCESSES: Dict[str, subprocess.Popen] = {}
+
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _to_ist_str(iso_or_dt: Any) -> str:
+    """Format an ISO UTC string or datetime to Indian Standard Time (IST)."""
+    if not iso_or_dt:
+        return ""
+    try:
+        if isinstance(iso_or_dt, str):
+            dt = datetime.datetime.fromisoformat(iso_or_dt)
+        else:
+            dt = iso_or_dt
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt_ist = dt.astimezone(_IST)
+        return dt_ist.strftime("%d %b %Y, %I:%M %p IST")
+    except Exception:
+        return str(iso_or_dt)
 
 
 def _now_iso() -> str:
@@ -269,8 +288,9 @@ def list_all_jobs() -> List[dict]:
     """Return summary list of all jobs ordered by newest first."""
     res = []
     for j in sorted(_JOBS.values(), key=lambda x: x.get("created_at", ""), reverse=True):
+        job_id = j["job_id"]
         res.append({
-            "job_id": j["job_id"],
+            "job_id": job_id,
             "status": j["status"],
             "name": j["input"]["name"],
             "size_mb": j["input"]["size_mb"],
@@ -279,6 +299,8 @@ def list_all_jobs() -> List[dict]:
             "preset": j["options"]["preset"],
             "voice": j["options"]["voice"],
             "created_at": j["created_at"],
+            "created_at_ist": _to_ist_str(j.get("created_at")),
+            "thumbnail_url": f"/api/jobs/{job_id}/thumbnail",
             "error": j.get("error"),
         })
     return res
@@ -351,6 +373,14 @@ async def execute_job(job_id: str, start_from_stage: Optional[str] = None) -> No
             job["input"]["height"] = h
             job["input"]["duration_s"] = round(dur, 1)
             job["input"]["orientation"] = "portrait" if h > w else "landscape"
+
+            # Generate preview thumbnail (first frame) if not already created
+            thumb_path = job_dir / "thumbnail.jpg"
+            if not thumb_path.exists():
+                try:
+                    await asyncio.to_thread(extract_video_thumbnail, input_video, str(thumb_path))
+                except Exception as th_err:
+                    print(f"[job_manager] Thumbnail generation warning: {th_err}")
 
             update_stage(job_id, "extract", "running", 50.0, f"Detected {w}x{h} ({dur:.1f}s) — extracting audio...")
             await asyncio.to_thread(extract_audio, input_video, extracted_wav, 48000)
