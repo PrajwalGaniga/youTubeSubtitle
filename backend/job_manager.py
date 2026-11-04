@@ -88,27 +88,27 @@ def package_job_files(job_id: str) -> list[dict]:
     bundle_zip = str(job_dir / "bundle.zip")
 
     # Build ZIP bundle
+    base_name = job["input"]["name"].rsplit(".", 1)[0] if job and job.get("input") and job["input"].get("name") else "video"
     try:
         with zipfile.ZipFile(bundle_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             if os.path.exists(burned_mp4) and os.path.getsize(burned_mp4) > 0:
-                base_name = job["input"]["name"].rsplit(".", 1)[0]
-                zf.write(burned_mp4, f"{base_name}_subtitled.mp4")
+                zf.write(burned_mp4, f"{base_name}_sub.mp4")
             if os.path.exists(clean_wav):
-                zf.write(clean_wav, "enhanced_audio.wav")
+                zf.write(clean_wav, f"{base_name}_clean_audio.wav")
             if os.path.exists(extracted_wav):
-                zf.write(extracted_wav, "raw_audio.wav")
+                zf.write(extracted_wav, f"{base_name}_raw_audio.wav")
             if os.path.exists(srt_path):
-                zf.write(srt_path, "subtitles.srt")
+                zf.write(srt_path, f"{base_name}_subtitles.srt")
             if os.path.exists(ass_path):
-                zf.write(ass_path, "subtitles.ass")
+                zf.write(ass_path, f"{base_name}_subtitles.ass")
             if os.path.exists(transcript_txt):
-                zf.write(transcript_txt, "transcript.txt")
+                zf.write(transcript_txt, f"{base_name}_transcript.txt")
     except Exception as e:
         print(f"[job_manager] Warning: failed to build zip bundle for {job_id}: {e}")
 
     files_list = []
     file_defs = [
-        ("final_video.mp4", "Final Video (.mp4)", burned_mp4),
+        ("final_video.mp4", f"{base_name}_sub.mp4", burned_mp4),
         ("cleaned_audio.wav", "Cleaned Audio (.wav)", clean_wav),
         ("extracted_audio.wav", "Original Audio (.wav)", extracted_wav),
         ("captions.srt", "Subtitles (.srt)", srt_path),

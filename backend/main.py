@@ -457,10 +457,17 @@ async def download_job_file(job_id: str, filename: str):
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Job directory not found.")
 
+    # Determine base filename from original upload (e.g., FirstClip.mp4 -> FirstClip)
+    job = get_job(job_id)
+    base_name = "video"
+    if job and job.get("input") and job["input"].get("name"):
+        base_name = os.path.splitext(job["input"]["name"])[0]
+
     # Mapping logical asset names to physical files
     file_map = {
         "final_video.mp4": job_dir / "final_output.mp4",
         "final_output.mp4": job_dir / "final_output.mp4",
+        f"{base_name}_sub.mp4": job_dir / "final_output.mp4",
         "input.mp4": job_dir / "input.mp4",
         "cleaned_audio.wav": job_dir / "clean_audio.wav",
         "clean_audio.wav": job_dir / "clean_audio.wav",
@@ -476,12 +483,25 @@ async def download_job_file(job_id: str, filename: str):
 
     target = file_map.get(filename)
     if not target or not target.exists():
-        # Check if it's a generated reformatted video in job_dir
-        candidate = job_dir / filename
-        if candidate.exists() and candidate.is_file() and candidate.parent.resolve() == job_dir.resolve():
-            target = candidate
+        if filename.endswith("_sub.mp4") and (job_dir / "final_output.mp4").exists():
+            target = job_dir / "final_output.mp4"
         else:
-            raise HTTPException(status_code=404, detail=f"File '{filename}' not found for this job.")
+            # Check if it's a generated reformatted video in job_dir
+            candidate = job_dir / filename
+            if candidate.exists() and candidate.is_file() and candidate.parent.resolve() == job_dir.resolve():
+                target = candidate
+            else:
+                raise HTTPException(status_code=404, detail=f"File '{filename}' not found for this job.")
+
+    # Compute user-facing download filename
+    download_filename = filename
+    if filename in ("final_video.mp4", "final_output.mp4") or filename.endswith("_sub.mp4"):
+        download_filename = f"{base_name}_sub.mp4"
+    elif filename.startswith("final_") and filename.endswith(".mp4"):
+        suffix = filename[len("final_"):-4]
+        download_filename = f"{base_name}_sub_{suffix}.mp4"
+    elif filename == "bundle.zip":
+        download_filename = f"{base_name}_bundle.zip"
 
     media_types = {
         ".mp4": "video/mp4",
@@ -498,7 +518,7 @@ async def download_job_file(job_id: str, filename: str):
     return FileResponse(
         path=str(target),
         media_type=media_type,
-        filename=filename,
+        filename=download_filename,
     )
 
 

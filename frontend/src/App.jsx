@@ -652,7 +652,7 @@ export default function App() {
     if (targetAspect === 'original') {
       const link = document.createElement('a')
       link.href = `/api/jobs/${jobId}/files/final_video.mp4`
-      link.download = `${baseName}_subtitled.mp4`
+      link.download = `${baseName}_sub.mp4`
       document.body.appendChild(link)
       link.click()
       document.body.removeChild(link)
@@ -686,7 +686,7 @@ export default function App() {
       const data = await res.json()
       const link = document.createElement('a')
       link.href = data.download_url
-      link.download = `${baseName}_${targetAspect.replace(':', '_')}_${mode}.mp4`
+      link.download = `${baseName}_sub_${targetAspect.replace(':', '_')}_${mode}.mp4`
       document.body.appendChild(link)
       link.click()
       document.body.removeChild(link)

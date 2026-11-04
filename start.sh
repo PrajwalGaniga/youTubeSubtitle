@@ -64,3 +64,4 @@ echo " Press Ctrl+C in this terminal to stop both servers"
 echo "=================================================="
 
 wait
+

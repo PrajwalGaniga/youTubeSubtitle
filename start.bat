@@ -49,3 +49,4 @@ echo  YT-sub Studio is running!
 echo  Browser opened at: http://localhost:5173
 echo ==================================================
 pause
+
