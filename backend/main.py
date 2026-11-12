@@ -16,10 +16,11 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -452,6 +453,125 @@ async def export_reformatted_video(
         "cached": False,
         "size_mb": round(out_path.stat().st_size / (1024 * 1024), 2),
     }
+
+
+@app.post("/api/jobs/{job_id}/save-to-folder", tags=["downloads"])
+async def save_job_file_to_folder(
+    job_id: str,
+    target_aspect: str = Form("original"),
+    mode: str = Form("letterbox"),
+    folder_path: str = Form(...),
+    custom_filename: Optional[str] = Form(None),
+):
+    """
+    Export and save a video or asset directly into the user's specified local folder path on their PC.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Job directory not found.")
+
+    base_name = "video"
+    if job.get("input") and job["input"].get("name"):
+        base_name = os.path.splitext(job["input"]["name"])[0]
+
+    # Validate destination folder
+    dest_dir_str = folder_path.strip().strip('"').strip("'")
+    if not dest_dir_str:
+        raise HTTPException(status_code=400, detail="Destination folder path is required.")
+
+    try:
+        dest_dir = Path(dest_dir_str).resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot create or access folder '{dest_dir_str}': {exc}")
+
+    # Determine source file
+    if target_aspect == "original":
+        source_file = job_dir / "final_output.mp4"
+        if not source_file.exists() or source_file.stat().st_size == 0:
+            raise HTTPException(status_code=400, detail="Final subtitled video is not ready yet.")
+        out_filename = custom_filename or f"{base_name}_sub.mp4"
+    else:
+        aspect_slug = "9_16" if target_aspect == "9:16" else "16_9"
+        mode_slug = "crop" if mode == "crop" else "letterbox"
+        source_filename = f"final_{aspect_slug}_{mode_slug}.mp4"
+        source_file = job_dir / source_filename
+
+        # If not already reformatted, reformat now
+        if not source_file.exists() or source_file.stat().st_size == 0:
+            burned_mp4 = job_dir / "final_output.mp4"
+            if not burned_mp4.exists() or burned_mp4.stat().st_size == 0:
+                raise HTTPException(status_code=400, detail="Final subtitled video is not ready yet.")
+            try:
+                await asyncio.to_thread(
+                    reformat_video_aspect,
+                    input_video=str(burned_mp4),
+                    output_video=str(source_file),
+                    target_aspect=target_aspect,
+                    mode=mode,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Reformatting failed: {exc}")
+
+        out_filename = custom_filename or f"{base_name}_sub_{aspect_slug}_{mode_slug}.mp4"
+
+    dest_file = dest_dir / out_filename
+    try:
+        shutil.copy2(source_file, dest_file)
+        log_job(job_id, "export", f"Exported file saved directly to folder: {dest_file}")
+        return {
+            "success": True,
+            "filename": out_filename,
+            "folder_path": str(dest_dir),
+            "full_path": str(dest_file),
+            "size_mb": round(dest_file.stat().st_size / (1024 * 1024), 2),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to copy file to '{dest_dir}': {exc}")
+
+
+@app.get("/api/system/common-folders", tags=["system"])
+async def get_system_common_folders():
+    """Return common user folders (Desktop, Videos, Downloads, Documents) for quick export selection."""
+    home = Path.home()
+    folders = {
+        "desktop": str(home / "Desktop"),
+        "videos": str(home / "Videos"),
+        "downloads": str(home / "Downloads"),
+        "documents": str(home / "Documents"),
+    }
+    result = {k: v for k, v in folders.items() if os.path.isdir(v)}
+    return {"home": str(home), "folders": result}
+
+
+@app.post("/api/system/open-explorer", tags=["system"])
+async def open_in_file_explorer(payload: dict = Body(...)):
+    """Open Windows File Explorer with the saved file or folder selected."""
+    target_path = payload.get("path", "").strip().strip('"').strip("'")
+    if not target_path:
+        raise HTTPException(status_code=400, detail="Path is required.")
+
+    p = Path(target_path).resolve()
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="File or folder does not exist.")
+
+    try:
+        if sys.platform.startswith("win"):
+            if p.is_file():
+                subprocess.Popen(["explorer", f"/select,{str(p)}"])
+            else:
+                subprocess.Popen(["explorer", str(p)])
+        elif sys.platform.startswith("darwin"):
+            subprocess.Popen(["open", "-R" if p.is_file() else "", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p.parent if p.is_file() else p)])
+        return {"success": True, "opened": str(p)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open explorer: {exc}")
 
 
 @app.get("/api/jobs/{job_id}/files/{filename}", tags=["downloads"])

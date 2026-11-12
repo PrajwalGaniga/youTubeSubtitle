@@ -143,6 +143,73 @@ function formatIST(isoString) {
   }
 }
 
+/**
+ * Prompts user with native OS "Save As" file dialog (asking folder location and filename),
+ * then writes the file stream directly into that chosen location.
+ * Falls back to standard anchor download if API unavailable.
+ */
+async function downloadWithSavePicker(downloadUrl, defaultFileName, prePickedHandle = null) {
+  if (prePickedHandle) {
+    try {
+      const res = await fetch(downloadUrl)
+      if (!res.ok) throw new Error(`Download failed (${res.status})`)
+      const writable = await prePickedHandle.createWritable()
+      if (res.body && typeof res.body.pipeTo === 'function') {
+        await res.body.pipeTo(writable)
+      } else {
+        const blob = await res.blob()
+        await writable.write(blob)
+        await writable.close()
+      }
+      return { success: true, method: 'picker' }
+    } catch (err) {
+      console.warn('Writing to prePickedHandle failed, falling back:', err)
+    }
+  }
+
+  if (typeof window !== 'undefined' && 'showSaveFilePicker' in window && !prePickedHandle) {
+    try {
+      const ext = defaultFileName.includes('.') ? '.' + defaultFileName.split('.').pop() : '.mp4'
+      const handle = await window.showSaveFilePicker({
+        suggestedName: defaultFileName,
+        types: [
+          {
+            description: defaultFileName.endsWith('.mp4') ? 'MP4 Video' : 'File Asset',
+            accept: {
+              'video/mp4': ['.mp4'],
+            },
+          },
+        ],
+      })
+      const res = await fetch(downloadUrl)
+      if (!res.ok) throw new Error(`Download failed (${res.status})`)
+      const writable = await handle.createWritable()
+      if (res.body && typeof res.body.pipeTo === 'function') {
+        await res.body.pipeTo(writable)
+      } else {
+        const blob = await res.blob()
+        await writable.write(blob)
+        await writable.close()
+      }
+      return { success: true, method: 'picker' }
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return { cancelled: true }
+      }
+      console.warn('showSaveFilePicker failed, falling back:', err)
+    }
+  }
+
+  // Fallback anchor
+  const link = document.createElement('a')
+  link.href = downloadUrl
+  link.download = defaultFileName
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  return { success: true, method: 'fallback' }
+}
+
 // ---------------------------------------------------------------------------
 // Main Application Component
 // ---------------------------------------------------------------------------
@@ -192,6 +259,13 @@ export default function App() {
   const [reformattingFormat, setReformattingFormat] = useState(null)
   const [reformatError, setReformatError] = useState('')
 
+  // Save Destination & Folder Selection
+  const [saveMode, setSaveMode] = useState(() => localStorage.getItem('ytsub_save_mode') || 'ask') // 'ask' | 'folder'
+  const [customFolderPath, setCustomFolderPath] = useState(() => localStorage.getItem('ytsub_export_folder') || '')
+  const [commonFolders, setCommonFolders] = useState({})
+  const [exportSuccessInfo, setExportSuccessInfo] = useState(null)
+  const [copiedSavedPath, setCopiedSavedPath] = useState(false)
+
   // Synced Player & A/B Audio State
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -230,6 +304,23 @@ export default function App() {
     }
     fetchHealth()
     fetchProjects()
+
+    // Fetch common system folders for quick export destination selection
+    fetch('/api/system/common-folders')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.folders) {
+          setCommonFolders(data.folders)
+          if (!localStorage.getItem('ytsub_export_folder')) {
+            const defPath = data.folders.videos || data.folders.desktop || ''
+            if (defPath) {
+              setCustomFolderPath(defPath)
+              localStorage.setItem('ytsub_export_folder', defPath)
+            }
+          }
+        }
+      })
+      .catch(() => {})
     const timer = setInterval(() => {
       fetchHealth()
       fetchProjects()
@@ -655,6 +746,7 @@ export default function App() {
     setFormatModalJob(targetJob || job)
     setIsFormatModalOpen(true)
     setReformatError('')
+    setExportSuccessInfo(null)
   }
 
   const closeFormatModal = () => {
@@ -662,6 +754,20 @@ export default function App() {
     setIsFormatModalOpen(false)
     setFormatModalJob(null)
     setReformatError('')
+    setExportSuccessInfo(null)
+  }
+
+  const handleOpenExplorer = async (path) => {
+    if (!path) return
+    try {
+      await fetch('/api/system/open-explorer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      })
+    } catch (err) {
+      console.error('Failed to open explorer:', err)
+    }
   }
 
   const handleExportAndDownload = async (targetAspect, mode) => {
@@ -669,16 +775,77 @@ export default function App() {
     if (!j) return
     const jobId = j.job_id
     const baseName = j.input?.name ? j.input.name.replace(/\.[^/.]+$/, '') : 'video'
+    const aspectSlug = targetAspect === 'original' ? '' : `_${targetAspect.replace(':', '_')}_${mode}`
+    const defaultFileName = `${baseName}_sub${aspectSlug}.mp4`
 
-    if (targetAspect === 'original') {
-      const link = document.createElement('a')
-      link.href = `/api/jobs/${jobId}/files/final_video.mp4`
-      link.download = `${baseName}_sub.mp4`
-      document.body.appendChild(link)
-      link.click()
-      document.body.removeChild(link)
-      setIsFormatModalOpen(false)
+    setReformatError('')
+    setExportSuccessInfo(null)
+
+    // Option A: Save directly to user-specified local folder path on their PC
+    if (saveMode === 'folder') {
+      const targetFolder = (customFolderPath || '').trim()
+      if (!targetFolder) {
+        setReformatError('Please enter or select a destination folder path first.')
+        return
+      }
+
+      setIsReformatting(true)
+      setReformattingFormat(
+        `${targetAspect === '9:16' ? 'YouTube Shorts (9:16)' : targetAspect === '16:9' ? 'Landscape (16:9)' : 'Original'} • Saving to ${targetFolder}...`
+      )
+
+      try {
+        const formData = new FormData()
+        formData.append('target_aspect', targetAspect)
+        formData.append('mode', mode)
+        formData.append('folder_path', targetFolder)
+        formData.append('custom_filename', defaultFileName)
+
+        const res = await fetch(`/api/jobs/${jobId}/save-to-folder`, {
+          method: 'POST',
+          body: formData,
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.detail || `Saving to folder failed (${res.status})`)
+        }
+        const data = await res.json()
+        setExportSuccessInfo({
+          full_path: data.full_path,
+          folder_path: data.folder_path,
+          filename: data.filename,
+          size_mb: data.size_mb,
+          method: 'folder',
+        })
+      } catch (err) {
+        setReformatError(err.message || 'Export error')
+      } finally {
+        setIsReformatting(false)
+        setReformattingFormat(null)
+      }
       return
+    }
+
+    // Option B: Native OS "Save As" file picker (asks user which folder location and filename)
+    let prePickedHandle = null
+    if (typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
+      try {
+        prePickedHandle = await window.showSaveFilePicker({
+          suggestedName: defaultFileName,
+          types: [
+            {
+              description: 'MP4 Video',
+              accept: { 'video/mp4': ['.mp4'] },
+            },
+          ],
+        })
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          // User cancelled the Save dialog
+          return
+        }
+        console.warn('showSaveFilePicker prompt failed:', err)
+      }
     }
 
     setIsReformatting(true)
@@ -687,31 +854,36 @@ export default function App() {
         mode === 'letterbox' ? 'Fit & Letterbox' : 'Center Crop'
       }`
     )
-    setReformatError('')
 
     try {
-      const formData = new FormData()
-      formData.append('target_aspect', targetAspect)
-      formData.append('mode', mode)
+      let downloadUrl = `/api/jobs/${jobId}/files/final_video.mp4`
 
-      const res = await fetch(`/api/jobs/${jobId}/reformat`, {
-        method: 'POST',
-        body: formData,
-      })
+      if (targetAspect !== 'original') {
+        const formData = new FormData()
+        formData.append('target_aspect', targetAspect)
+        formData.append('mode', mode)
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || `Reformatting failed (${res.status})`)
+        const res = await fetch(`/api/jobs/${jobId}/reformat`, {
+          method: 'POST',
+          body: formData,
+        })
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.detail || `Reformatting failed (${res.status})`)
+        }
+
+        const data = await res.json()
+        downloadUrl = data.download_url
       }
 
-      const data = await res.json()
-      const link = document.createElement('a')
-      link.href = data.download_url
-      link.download = `${baseName}_sub_${targetAspect.replace(':', '_')}_${mode}.mp4`
-      document.body.appendChild(link)
-      link.click()
-      document.body.removeChild(link)
-      setIsFormatModalOpen(false)
+      const saveResult = await downloadWithSavePicker(downloadUrl, defaultFileName, prePickedHandle)
+      if (!saveResult.cancelled) {
+        setExportSuccessInfo({
+          filename: defaultFileName,
+          method: 'picker',
+        })
+      }
     } catch (err) {
       setReformatError(err.message || 'Export error')
     } finally {
@@ -1812,11 +1984,18 @@ export default function App() {
                           <Download size={16} color="#F5B50A" />
                         </div>
                       ) : (
-                        <a
+                        <div
                           key={f.name}
-                          href={`/api/jobs/${activeJobId}/files/${f.name}`}
-                          download={f.name}
                           className={styles.fileCardItem}
+                          style={{ cursor: 'pointer' }}
+                          onClick={() =>
+                            downloadWithSavePicker(
+                              `/api/jobs/${activeJobId}/files/${f.name}`,
+                              f.name,
+                              null
+                            )
+                          }
+                          title="Click to download and choose destination folder"
                         >
                           <div className={styles.fileItemLeft}>
                             {f.name.endsWith('.wav') ? (
@@ -1832,7 +2011,7 @@ export default function App() {
                             </div>
                           </div>
                           <Download size={16} color="var(--text-faint)" />
-                        </a>
+                        </div>
                       )
                     })}
                   </div>
@@ -2209,6 +2388,127 @@ export default function App() {
               <div className={styles.setupErrorCard} style={{ marginBottom: 16 }}>
                 <AlertCircle size={16} />
                 <span>{reformatError}</span>
+              </div>
+            )}
+
+            {/* Save Location / Folder Destination Section */}
+            <div className={styles.destinationSection}>
+              <div className={styles.destinationHeader}>
+                <FolderOpen size={16} color="#F5B50A" />
+                <span style={{ fontWeight: 600, color: '#fff', fontSize: '0.88rem' }}>
+                  Save Location / Folder Destination
+                </span>
+              </div>
+
+              <div className={styles.destinationToggleRow}>
+                <button
+                  type="button"
+                  className={`${styles.destModeBtn} ${saveMode === 'ask' ? styles.destModeBtnActive : ''}`}
+                  onClick={() => {
+                    setSaveMode('ask')
+                    localStorage.setItem('ytsub_save_mode', 'ask')
+                  }}
+                >
+                  <span className={styles.destRadioDot}>{saveMode === 'ask' && <span />}</span>
+                  <span>📁 <strong>Ask where to save</strong> (Windows Explorer Save As Dialog)</span>
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.destModeBtn} ${saveMode === 'folder' ? styles.destModeBtnActive : ''}`}
+                  onClick={() => {
+                    setSaveMode('folder')
+                    localStorage.setItem('ytsub_save_mode', 'folder')
+                  }}
+                >
+                  <span className={styles.destRadioDot}>{saveMode === 'folder' && <span />}</span>
+                  <span>💾 <strong>Save directly to folder path</strong></span>
+                </button>
+              </div>
+
+              {saveMode === 'folder' && (
+                <div className={styles.folderInputWrap}>
+                  <div className={styles.folderInputRow}>
+                    <input
+                      type="text"
+                      className={styles.folderTextInput}
+                      placeholder="e.g. C:\Users\Prajwal\Videos or D:\YouTube\Final"
+                      value={customFolderPath}
+                      onChange={(e) => {
+                        setCustomFolderPath(e.target.value)
+                        localStorage.setItem('ytsub_export_folder', e.target.value)
+                      }}
+                    />
+                  </div>
+
+                  {commonFolders && Object.keys(commonFolders).length > 0 && (
+                    <div className={styles.quickFoldersRow}>
+                      <span style={{ fontSize: '0.72rem', color: 'var(--text-faint)', marginRight: 4 }}>
+                        Quick Presets:
+                      </span>
+                      {Object.entries(commonFolders).map(([key, fpath]) => (
+                        <button
+                          key={key}
+                          type="button"
+                          className={`${styles.quickFolderChip} ${customFolderPath === fpath ? styles.quickFolderChipActive : ''}`}
+                          onClick={() => {
+                            setCustomFolderPath(fpath)
+                            localStorage.setItem('ytsub_export_folder', fpath)
+                          }}
+                          title={fpath}
+                        >
+                          {key === 'desktop' ? '🖥️ Desktop' : key === 'videos' ? '🎬 Videos' : key === 'downloads' ? '📥 Downloads' : `📁 ${key}`}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Export Success Notification Banner */}
+            {exportSuccessInfo && (
+              <div className={styles.exportSuccessCard}>
+                <CheckCircle2 size={20} color="#86EFAC" style={{ flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, color: '#86EFAC', fontSize: '0.9rem' }}>
+                    Export Completed Successfully!
+                  </div>
+                  {exportSuccessInfo.full_path ? (
+                    <div style={{ fontSize: '0.8rem', color: '#E2E8F0', marginTop: 4, wordBreak: 'break-all' }}>
+                      Saved to:{' '}
+                      <code className={styles.savedPathCode}>{exportSuccessInfo.full_path}</code>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '0.8rem', color: '#E2E8F0', marginTop: 4 }}>
+                      Saved as: <strong>{exportSuccessInfo.filename}</strong> inside your chosen folder location.
+                    </div>
+                  )}
+                </div>
+                {exportSuccessInfo.full_path && (
+                  <div style={{ display: 'flex', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className={styles.openExplorerBtn}
+                      onClick={() => handleOpenExplorer(exportSuccessInfo.full_path)}
+                      title="Open in Windows File Explorer"
+                    >
+                      <FolderOpen size={14} /> Open Folder
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.copyPathBtn}
+                      onClick={() => {
+                        navigator.clipboard.writeText(exportSuccessInfo.full_path)
+                        setCopiedSavedPath(true)
+                        setTimeout(() => setCopiedSavedPath(false), 2000)
+                      }}
+                      title="Copy file path"
+                    >
+                      {copiedSavedPath ? <Check size={14} /> : <Copy size={14} />}
+                      {copiedSavedPath ? 'Copied' : 'Copy Path'}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
