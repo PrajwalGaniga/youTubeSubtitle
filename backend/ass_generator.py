@@ -6,13 +6,14 @@ Converts SRT transcripts into kinetic, viral ASS subtitles with:
   - Proportional word-level timestamps & short 1-3 word punchy chunks
   - Power word / keyword detection (English & Hinglish)
   - Word-by-word active highlight & scale pop animations
-  - 6 viral creator style presets:
+  - 7 viral creator style presets:
       1. hormozi-yellow  (Impact/Anton, huge yellow highlight, bold outline)
       2. tiktok-box      (Inter Bold, 60% translucent dark pill box, cyan pop)
       3. mrbeast-green   (Luckiest Guy, neon green highlight, thick comic stroke)
       4. cyber-neon      (Orbitron, neon cyan fill, magenta outline, violet shadow)
       5. minimal-apple   (Inter Bold, clean white text, subtle shadow, sentence case)
       6. comic-bold      (Bangers, punchy white text, heavy outline, pink drop shadow)
+      7. veed-impact     (Anton hero word on solid box + Inter context, letter stagger)
 """
 
 from __future__ import annotations
@@ -261,6 +262,39 @@ PRESETS = {
             "landscape": {"fontSize": 48, "outline": 0, "shadow": 0, "spacing": 0, "boxPadding": 0},
         },
     },
+    "veed-impact": {
+        "id": "veed-impact",
+        "name": "VEED Hero Box",
+        "description": "3-layer hero: giant keyword on a solid color box + tracked context lines with letter stagger",
+        # hero word (Anton, opaque box)
+        "font": "Anton",
+        "bold": False,
+        "primary": "#000000",          # hero text color (black on box)
+        "highlight": "#FF1E1E",        # box fill color — user can override
+        "outline_color": "#FF1E1E",    # same as box fill for BorderStyle=3
+        "outline_alpha": 0,
+        "back_color": "#FF1E1E",
+        "back_alpha": 0,
+        "border_style": 3,
+        "uppercase": True,
+        "pop": False,
+        "highlight_mode": "none",
+        "active_scale": 100,
+        # context line (Inter Bold, no box)
+        "ctx_font": "Inter",
+        "ctx_bold": True,
+        "ctx_color": "#FFFFFF",
+        "ctx_outline_color": "#000000",
+        "ctx_outline": 2.5,            # thin black outline for legibility
+        "ctx_shadow": 1.5,
+        "ctx_spacing": 1.5,
+        "ctx_border_style": 1,
+        "default_position": {"portrait": "center", "landscape": "center"},
+        "layout": {
+            "portrait":  {"heroSize": 110, "ctxSize": 44, "outline": 0, "shadow": 0, "spacing": 0, "boxPadding": 22},
+            "landscape": {"heroSize": 72,  "ctxSize": 32, "outline": 0, "shadow": 0, "spacing": 0, "boxPadding": 16},
+        },
+    },
 }
 
 
@@ -410,6 +444,206 @@ def chunk_to_events(chunk: list[Word], next_start: Optional[float], s: StyleSpec
     return events
 
 
+# ---------------------------------------------------------------------------
+# VEED Hero Box — Letter Stagger & Multi-layer ASS
+# ---------------------------------------------------------------------------
+STAGGER_MS_PER_CHAR = 28   # ms between each character fade-in
+STAGGER_FADE_MS     = 110  # ms for each character to fade from transparent → opaque
+MAX_STAGGER_CHARS   = 22   # characters beyond this appear instantly (no lag build-up)
+
+
+def build_stagger_text(text: str, start_offset_ms: int = 0) -> str:
+    """
+    Wraps every character of *text* in ASS alpha-stagger tags so each letter
+    fades in softly, one after another.
+
+    Characters beyond MAX_STAGGER_CHARS are shown immediately (alpha 0 from start)
+    to prevent long lines from feeling slow.
+    """
+    result = []
+    for i, ch in enumerate(text):
+        if i >= MAX_STAGGER_CHARS:
+            # Show immediately — no stagger tag needed
+            result.append(ch)
+            continue
+        t0 = start_offset_ms + i * STAGGER_MS_PER_CHAR
+        t1 = t0 + STAGGER_FADE_MS
+        # Start fully transparent (\alpha&HFF&), fade to fully opaque (\alpha&H00&)
+        tag = "{\\alpha&HFF&\\t(" + str(t0) + "," + str(t1) + ",\\alpha&H00&)}"
+        result.append(tag + ch)
+    return "".join(result)
+
+
+def _pick_hero_word(chunk: list[Word]) -> int:
+    """
+    Return the index of the single best hero keyword in a chunk.
+    Returns -1 if no word scores high enough (plain-text fallback).
+    """
+    best_idx = -1
+    best_score = 1.5   # minimum threshold to trigger hero box
+    for i, w in enumerate(chunk):
+        sc = score_word(w.text, i, len(chunk))
+        if sc > best_score:
+            best_score = sc
+            best_idx = i
+    return best_idx
+
+
+def build_hero_box_ass(
+    chunks: list[list[Word]],
+    preset: dict,
+    width: int,
+    height: int,
+    highlight_color: Optional[str] = None,
+) -> str:
+    """
+    Generate a multi-layer ASS document for the veed-impact preset.
+
+    For each chunk:
+      • Layer 0 — top context (words BEFORE hero) — VeedCtx style, stagger anim
+      • Layer 1 — hero word (biggest impact word)  — VeedHero style, solid box
+      • Layer 2 — bottom context (words AFTER hero) — VeedCtx style, stagger anim
+
+    If no hero keyword is found, falls back to a single centered VeedCtx dialogue.
+    """
+    is_portrait = height >= width * 1.1
+    orient = "portrait" if is_portrait else "landscape"
+    lay = preset["layout"][orient]
+
+    k = min(width, height) / 1080.0  # resolution scale factor
+
+    hero_size = round(lay["heroSize"] * k, 1)
+    ctx_size  = round(lay["ctxSize"]  * k, 1)
+
+    # Box fill / outline — user highlight_color overrides preset default
+    box_color   = highlight_color or preset["highlight"]
+    box_ass     = hex_to_ass(box_color, 0)        # opaque box
+    hero_txt    = hex_to_ass(preset["primary"], 0) # black text on box
+    ctx_primary = hex_to_ass(preset["ctx_color"], 0)
+    ctx_outline_ass = hex_to_ass(preset["ctx_outline_color"], 0)
+
+    ctx_outline_px = round(preset["ctx_outline"] * k, 1)
+    ctx_shadow_px  = round(preset["ctx_shadow"]  * k, 1)
+    ctx_spacing_px = round(preset["ctx_spacing"] * k, 1)
+    box_padding_px = round(lay["boxPadding"] * k, 1)
+
+    ctx_bold_flag = -1 if preset.get("ctx_bold") else 0
+
+    # --- Style lines ---
+    # VeedHero: Anton, giant, solid opaque box, black text, center alignment
+    hero_style = (
+        f"Style: VeedHero,{preset['font']},{hero_size:g},"
+        f"{hero_txt},{hero_txt},"
+        f"{box_ass},{box_ass},"
+        f"0,0,0,0,100,100,0,0,3,"
+        f"{box_padding_px:g},0,5,0,0,0,1"
+    )
+
+    # VeedCtx: Inter Bold, medium, no box, white with thin black outline, center
+    ctx_style = (
+        f"Style: VeedCtx,{preset['ctx_font']},{ctx_size:g},"
+        f"{ctx_primary},{ctx_primary},"
+        f"{ctx_outline_ass},&H00000000,"
+        f"{ctx_bold_flag},0,0,0,100,100,{ctx_spacing_px:g},0,1,"
+        f"{ctx_outline_px:g},{ctx_shadow_px:g},5,0,0,0,1"
+    )
+
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"{hero_style}\n"
+        f"{ctx_style}\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    # Vertical positioning — anchor at screen center, offset ctx lines around hero
+    cx = width  // 2
+    cy = height // 2
+
+    # Hero box sits at exact center; context lines sit above/below it
+    # We use \pos(x,y) with \an5 (center-center) for hero
+    # and \an2 (bottom-center) / \an8 (top-center) placed at offset y positions
+    hero_y   = cy
+    # Offset: half hero height + small gap + half ctx height
+    # Approximate hero line height from font size
+    hero_half = int(hero_size * 0.65)
+    ctx_half  = int(ctx_size  * 0.65)
+    gap       = int(ctx_size  * 0.3)
+
+    top_ctx_y    = cy - hero_half - gap - ctx_half
+    bottom_ctx_y = cy + hero_half + gap + ctx_half
+
+    dialogue_lines: list[str] = []
+
+    for k_idx, chunk in enumerate(chunks):
+        nxt_start = chunks[k_idx + 1][0].start if k_idx + 1 < len(chunks) else None
+        last_end  = chunk[-1].end + 0.15
+        if nxt_start is not None:
+            last_end = min(last_end, nxt_start)
+        last_end = max(last_end, chunk[-1].end + 0.04)
+
+        t_start = chunk[0].start
+        t_end   = last_end
+
+        hero_idx = _pick_hero_word(chunk)
+
+        if hero_idx == -1:
+            # ── Fallback: no hero word — render all words as plain context (center) ──
+            plain_text = " ".join(
+                ass_escape(w.text.upper()) for w in chunk
+            )
+            stagger = build_stagger_text(plain_text, start_offset_ms=0)
+            pos_tag = f"{{\\an5\\pos({cx},{cy})}}"
+            dialogue_lines.append(
+                f"Dialogue: 1,{ass_time(t_start)},{ass_time(t_end)},VeedCtx,,0,0,0,,{pos_tag}{stagger}"
+            )
+            continue
+
+        # Split chunk around hero index
+        before_words = chunk[:hero_idx]
+        hero_word    = chunk[hero_idx]
+        after_words  = chunk[hero_idx + 1:]
+
+        # ── Hero line (Layer 1, VeedHero style) ──
+        hero_text = ass_escape(hero_word.text.upper())
+        # Scale-pop anim on hero: quick grow then settle
+        hero_anim = r"{\fscx80\fscy80\t(0,100,\fscx105\fscy105)\t(100,180,\fscx100\fscy100)}"
+        hero_pos  = f"{{\\an5\\pos({cx},{hero_y})}}"
+        dialogue_lines.append(
+            f"Dialogue: 1,{ass_time(t_start)},{ass_time(t_end)},VeedHero,,0,0,0,,{hero_pos}{hero_anim}{hero_text}"
+        )
+
+        # ── Top context line (Layer 0, VeedCtx style) ──
+        if before_words:
+            before_text = " ".join(ass_escape(w.text.upper()) for w in before_words)
+            before_stagger = build_stagger_text(before_text, start_offset_ms=0)
+            top_pos = f"{{\\an5\\pos({cx},{top_ctx_y})}}"
+            dialogue_lines.append(
+                f"Dialogue: 0,{ass_time(t_start)},{ass_time(t_end)},VeedCtx,,0,0,0,,{top_pos}{before_stagger}"
+            )
+
+        # ── Bottom context line (Layer 2, VeedCtx style) ──
+        if after_words:
+            after_text = " ".join(ass_escape(w.text.upper()) for w in after_words)
+            # Slight delay so bottom line staggers AFTER hero appears
+            after_stagger = build_stagger_text(after_text, start_offset_ms=60)
+            bottom_pos = f"{{\\an5\\pos({cx},{bottom_ctx_y})}}"
+            dialogue_lines.append(
+                f"Dialogue: 2,{ass_time(t_start)},{ass_time(t_end)},VeedCtx,,0,0,0,,{bottom_pos}{after_stagger}"
+            )
+
+    return header + "\n".join(dialogue_lines) + "\n"
+
+
 def build_ass_content(chunks: list[list[Word]], s: StyleSpec, width: int, height: int, style_name: str = "ViralCap") -> str:
     """Generate complete ASS subtitle document matching video resolution."""
     bc = s.outline_color if s.border_style == 3 else s.back_color
@@ -528,6 +762,21 @@ def generate_ass_from_srt(
 
     mark_keywords(all_words)
     chunks = chunk_words(all_words, max_words=3, max_chars=18)
+
+    # ── veed-impact uses a completely different multi-layer builder ──
+    if preset_id == "veed-impact":
+        preset = PRESETS["veed-impact"]
+        ass_text = build_hero_box_ass(
+            chunks,
+            preset=preset,
+            width=width,
+            height=height,
+            highlight_color=highlight_color,
+        )
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_text)
+        print(f"[ass_generator] veed-impact: {len(chunks)} chunks → {ass_path}")
+        return
 
     spec = resolve_style_spec(
         preset_id=preset_id,

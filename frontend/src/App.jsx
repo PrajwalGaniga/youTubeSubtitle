@@ -97,6 +97,15 @@ const PRESET_OPTIONS = [
     defaultColor: '#FF3B30',
   },
   {
+    id: 'veed-impact',
+    name: 'VEED Hero Box',
+    tag: 'Hero Impact',
+    fontClass: styles.fontAnton,
+    lead: 'THE',
+    highlight: 'TRUTH',
+    defaultColor: '#FF1E1E',
+  },
+  {
     id: 'no-subs',
     name: 'No Subtitles',
     tag: 'Audio Clean Only',
