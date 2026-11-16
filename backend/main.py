@@ -13,6 +13,7 @@ Features:
 
 from __future__ import annotations
 import asyncio
+import datetime
 import json
 import os
 import shutil
@@ -689,7 +690,7 @@ async def list_jobs_history():
 
 
 # ---------------------------------------------------------------------------
-# Audio to SRT Transcription Endpoints
+# Audio to SRT Transcription Background Pipeline & Endpoints
 # ---------------------------------------------------------------------------
 AUDIO_JOBS_DIR = Path(__file__).parent / "audio_jobs"
 AUDIO_JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -698,77 +699,178 @@ AUDIO_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma", ".m4b", ".webm"
 }
 
+_AUDIO_TASKS: dict[str, dict] = {}
+_AUDIO_LISTENERS: dict[str, list[asyncio.Queue]] = {}
 
-@app.post("/api/audio/transcribe", tags=["audio"])
-async def transcribe_audio_file(
-    file: UploadFile = File(..., description="Audio file (.mp3, .wav, .m4a, .aac, .flac, etc.)"),
-    clean_voice: bool = Form(True),
-    voice_mode: str = Form("studio"),
-):
-    """
-    Directly transcribe any uploaded audio file to a complete timestamped SRT subtitle file.
-    Optionally applies RNNoise neural voice cleaning and studio EQ before transcribing.
-    """
-    filename = file.filename or "audio.mp3"
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in AUDIO_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported audio format '{ext}'. Accepted formats: {', '.join(sorted(AUDIO_EXTENSIONS))}",
-        )
 
-    task_id = uuid.uuid4().hex[:8]
-    task_dir = AUDIO_JOBS_DIR / f"audio_{task_id}"
+def _broadcast_audio_event(task_id: str, data: dict):
+    if task_id in _AUDIO_LISTENERS:
+        payload = json.dumps(data)
+        for q in list(_AUDIO_LISTENERS[task_id]):
+            try:
+                q.put_nowait(payload)
+            except Exception:
+                pass
+
+
+def _save_audio_state(task_id: str):
+    task = _AUDIO_TASKS.get(task_id)
+    if not task:
+        return
+    task_dir = AUDIO_JOBS_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
+    state_file = task_dir / "state.json"
+    try:
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(task, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[audio] Error saving state for {task_id}: {e}")
 
-    input_audio_path = task_dir / f"input{ext}"
+
+def load_saved_audio_tasks():
+    """Load existing audio tasks from disk on server boot."""
+    if not AUDIO_JOBS_DIR.exists():
+        return
+    for folder in AUDIO_JOBS_DIR.iterdir():
+        if folder.is_dir():
+            state_file = folder / "state.json"
+            meta_file = folder / "meta.json"
+            task_id = folder.name
+            if state_file.exists():
+                try:
+                    with open(state_file, "r", encoding="utf-8") as f:
+                        _AUDIO_TASKS[task_id] = json.load(f)
+                except Exception:
+                    pass
+            elif meta_file.exists():
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    srt_file = folder / "subs.srt"
+                    txt_file = folder / "transcript.txt"
+                    srt_text = srt_file.read_text(encoding="utf-8", errors="replace") if srt_file.exists() else ""
+                    txt_text = txt_file.read_text(encoding="utf-8", errors="replace") if txt_file.exists() else ""
+                    created_at_val = meta.get("created_at")
+                    if not created_at_val:
+                        try:
+                            created_at_val = datetime.datetime.fromtimestamp(folder.stat().st_mtime, datetime.timezone.utc).isoformat()
+                        except Exception:
+                            created_at_val = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    _AUDIO_TASKS[task_id] = {
+                        "task_id": task_id,
+                        "status": "done",
+                        "stage": "done",
+                        "progress": 100.0,
+                        "message": f"Completed: {meta.get('lines_count', 0)} subtitle blocks",
+                        "filename": meta.get("filename", "audio.mp3"),
+                        "base_name": meta.get("base_name", "audio"),
+                        "duration_s": meta.get("duration_s", 0),
+                        "size_mb": meta.get("size_mb", 0),
+                        "created_at": created_at_val,
+                        "result": {
+                            "task_id": task_id,
+                            "filename": meta.get("filename", "audio.mp3"),
+                            "base_name": meta.get("base_name", "audio"),
+                            "duration_s": meta.get("duration_s", 0),
+                            "lines_count": meta.get("lines_count", 0),
+                            "words_count": meta.get("words_count", 0),
+                            "size_mb": meta.get("size_mb", 0),
+                            "srt": srt_text,
+                            "transcript": txt_text,
+                            "cleaned": meta.get("cleaned", False),
+                            "voice_mode": meta.get("voice_mode", "studio"),
+                            "download_url": f"/api/audio/{task_id}/download?format=srt",
+                            "txt_download_url": f"/api/audio/{task_id}/download?format=txt",
+                            "audio_url": f"/api/audio/{task_id}/audio",
+                        },
+                    }
+                    _save_audio_state(task_id)
+                except Exception as e:
+                    print(f"[audio] Error restoring {folder.name}: {e}")
+
+
+# Pre-load saved tasks on import
+load_saved_audio_tasks()
+
+
+async def run_audio_pipeline(task_id: str, clean_voice: bool, voice_mode: str):
+    """Asynchronous background pipeline for audio conversion and transcription."""
+    task = _AUDIO_TASKS.get(task_id)
+    if not task:
+        return
+    task_dir = AUDIO_JOBS_DIR / task_id
+
+    candidates = list(task_dir.glob("input.*"))
+    if not candidates:
+        task["status"] = "failed"
+        task["error"] = "Input audio file missing from disk."
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "failed", "error": task["error"]})
+        return
+
+    input_audio_path = candidates[0]
     raw_wav_path = task_dir / "raw_audio.wav"
     clean_wav_path = task_dir / "clean_audio.wav"
     srt_path = task_dir / "subs.srt"
     transcript_path = task_dir / "transcript.txt"
     meta_path = task_dir / "meta.json"
 
-    # Stream upload file to disk and enforce size limit
-    total_bytes = 0
     try:
-        with open(input_audio_path, "wb") as f_out:
-            while chunk := await file.read(1024 * 1024):
-                total_bytes += len(chunk)
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    f_out.close()
-                    shutil.rmtree(task_dir, ignore_errors=True)
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Audio file exceeds maximum size limit of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
-                    )
-                f_out.write(chunk)
-    except Exception as exc:
-        if isinstance(exc, HTTPException):
-            raise exc
-        shutil.rmtree(task_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}")
+        # Step 1: Converting to 48 kHz mono PCM WAV
+        task["status"] = "running"
+        task["stage"] = "convert"
+        task["progress"] = 20.0
+        task["message"] = "Converting audio stream to 48 kHz mono PCM stream..."
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "progress", "stage": "convert", "progress": 20.0, "message": task["message"]})
 
-    try:
-        # Convert audio to mono 48 kHz 16-bit PCM WAV via FFmpeg
         await asyncio.to_thread(extract_audio, str(input_audio_path), str(raw_wav_path), 48000)
         dur = await asyncio.to_thread(probe_video_duration, str(raw_wav_path))
+        task["duration_s"] = round(dur, 1)
 
-        # Optional audio cleaning (RNNoise + Studio EQ)
+        task["progress"] = 35.0
+        task["message"] = f"Detected {dur:.1f}s audio track ({dur/60:.1f} min). Preparing speech recognition..."
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "progress", "stage": "convert", "progress": 35.0, "message": task["message"]})
+
+        # Step 2: Optional Neural Voice Enhancement
         audio_for_transcribe = str(raw_wav_path)
         if clean_voice and voice_mode != "off":
+            task["stage"] = "enhance"
+            task["progress"] = 45.0
+            task["message"] = f"Running RNNoise neural speech denoiser + Studio vocal EQ ({voice_mode} mode)..."
+            _save_audio_state(task_id)
+            _broadcast_audio_event(task_id, {"type": "progress", "stage": "enhance", "progress": 45.0, "message": task["message"]})
+
             try:
                 await asyncio.to_thread(clean_audio, str(raw_wav_path), str(clean_wav_path), voice_mode)
                 if clean_wav_path.exists() and clean_wav_path.stat().st_size > 0:
                     audio_for_transcribe = str(clean_wav_path)
             except Exception as clean_err:
-                print(f"[audio_transcribe] Audio cleaning warning: {clean_err}")
+                print(f"[audio] Cleaning warning: {clean_err}")
                 audio_for_transcribe = str(raw_wav_path)
 
-        # Transcribe with Gemini
+            task["progress"] = 65.0
+            task["message"] = "Vocal track enhanced & normalized to broadcast -16 LUFS"
+            _save_audio_state(task_id)
+            _broadcast_audio_event(task_id, {"type": "progress", "stage": "enhance", "progress": 65.0, "message": task["message"]})
+
+        # Step 3: Gemini Transcription
+        task["stage"] = "transcribe"
+        task["progress"] = 75.0
+        task["message"] = "Uploading audio to Gemini AI and generating timestamped Romanized subtitles..."
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "progress", "stage": "transcribe", "progress": 75.0, "message": task["message"]})
+
         await asyncio.to_thread(transcribe, audio_for_transcribe, str(srt_path))
 
         if not srt_path.exists() or srt_path.stat().st_size == 0:
             raise RuntimeError("Gemini did not generate an SRT file.")
+
+        task["progress"] = 92.0
+        task["message"] = "Formatting subtitle blocks and compiling transcript..."
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "progress", "stage": "transcribe", "progress": 92.0, "message": task["message"]})
 
         with open(srt_path, "r", encoding="utf-8", errors="replace") as f_srt:
             srt_content = f_srt.read()
@@ -788,49 +890,217 @@ async def transcribe_audio_file(
         with open(transcript_path, "w", encoding="utf-8") as f_txt:
             f_txt.write(transcript_text)
 
-        base_name = os.path.splitext(filename)[0]
+        base_name = task.get("base_name", "audio")
+        created_at_str = task.get("created_at") or datetime.datetime.now(datetime.timezone.utc).isoformat()
         meta = {
-            "task_id": f"audio_{task_id}",
-            "filename": filename,
+            "task_id": task_id,
+            "filename": task.get("filename", "audio.mp3"),
             "base_name": base_name,
             "duration_s": round(dur, 1),
             "lines_count": lines_count,
             "words_count": words_count,
-            "size_mb": round(total_bytes / (1024 * 1024), 2),
+            "size_mb": task.get("size_mb", 0),
+            "created_at": created_at_str,
             "cleaned": bool(clean_voice and voice_mode != "off"),
             "voice_mode": voice_mode if clean_voice else "off",
         }
         with open(meta_path, "w", encoding="utf-8") as f_meta:
             json.dump(meta, f_meta, indent=2)
 
-        return {
-            "success": True,
-            "task_id": f"audio_{task_id}",
-            "filename": filename,
+        res_payload = {
+            "task_id": task_id,
+            "filename": task.get("filename", "audio.mp3"),
             "base_name": base_name,
             "duration_s": round(dur, 1),
             "lines_count": lines_count,
             "words_count": words_count,
-            "size_mb": round(total_bytes / (1024 * 1024), 2),
+            "size_mb": task.get("size_mb", 0),
+            "created_at": created_at_str,
             "srt": srt_content,
             "transcript": transcript_text,
             "cleaned": bool(clean_voice and voice_mode != "off"),
             "voice_mode": voice_mode if clean_voice else "off",
-            "download_url": f"/api/audio/audio_{task_id}/download?format=srt",
-            "txt_download_url": f"/api/audio/audio_{task_id}/download?format=txt",
-            "audio_url": f"/api/audio/audio_{task_id}/audio",
+            "download_url": f"/api/audio/{task_id}/download?format=srt",
+            "txt_download_url": f"/api/audio/{task_id}/download?format=txt",
+            "audio_url": f"/api/audio/{task_id}/audio",
         }
 
+        task["status"] = "done"
+        task["stage"] = "done"
+        task["progress"] = 100.0
+        task["message"] = f"Complete! Generated {lines_count} caption blocks ({words_count} words)"
+        task["result"] = res_payload
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "done", "result": res_payload})
+
     except Exception as exc:
-        print(f"[audio_transcribe] Transcription error: {exc}")
+        print(f"[audio] Task error {task_id}: {exc}")
         err_msg = str(exc)
         if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg.lower():
             err_msg = "Gemini AI servers are temporarily busy (503). Please try again in a few moments."
         elif "429" in err_msg or "quota" in err_msg.lower():
             err_msg = "Gemini API rate limit reached (429). Please wait a moment and retry."
         elif "valid SRT" in err_msg:
-            err_msg = "Could not detect clear speech in this audio recording. Please verify that the audio contains spoken words."
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {err_msg}")
+            err_msg = "Could not detect clear speech in this audio recording. Please check that audio contains audible speech."
+        task["status"] = "failed"
+        task["stage"] = "failed"
+        task["error"] = err_msg
+        _save_audio_state(task_id)
+        _broadcast_audio_event(task_id, {"type": "failed", "error": err_msg})
+
+
+@app.post("/api/audio/transcribe", tags=["audio"])
+async def transcribe_audio_file(
+    file: UploadFile = File(..., description="Audio file (.mp3, .wav, .m4a, .aac, .flac, etc.)"),
+    clean_voice: bool = Form(True),
+    voice_mode: str = Form("studio"),
+):
+    """
+    Directly transcribe any uploaded audio file to a complete timestamped SRT subtitle file.
+    Runs asynchronously with live SSE progress tracking.
+    """
+    filename = file.filename or "audio.mp3"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio format '{ext}'. Accepted formats: {', '.join(sorted(AUDIO_EXTENSIONS))}",
+        )
+
+    task_id = f"audio_{uuid.uuid4().hex[:8]}"
+    task_dir = AUDIO_JOBS_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    input_audio_path = task_dir / f"input{ext}"
+    base_name = os.path.splitext(filename)[0]
+
+    # Stream upload file to disk
+    total_bytes = 0
+    try:
+        with open(input_audio_path, "wb") as f_out:
+            while chunk := await file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    f_out.close()
+                    shutil.rmtree(task_dir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Audio file exceeds maximum size limit of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                    )
+                f_out.write(chunk)
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}")
+
+    size_mb = round(total_bytes / (1024 * 1024), 2)
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Initialize task state
+    task_state = {
+        "task_id": task_id,
+        "status": "running",
+        "stage": "convert",
+        "progress": 10.0,
+        "message": f"Upload complete ({size_mb} MB). Converting audio stream...",
+        "filename": filename,
+        "base_name": base_name,
+        "size_mb": size_mb,
+        "duration_s": 0,
+        "created_at": now_iso,
+        "error": None,
+        "result": None,
+    }
+    _AUDIO_TASKS[task_id] = task_state
+    _save_audio_state(task_id)
+
+    # Launch background task
+    asyncio.create_task(run_audio_pipeline(task_id, clean_voice, voice_mode))
+
+    return {
+        "task_id": task_id,
+        "status": "running",
+        "message": task_state["message"],
+    }
+
+
+@app.get("/api/audio/{task_id}/status", tags=["audio"])
+async def get_audio_task_status(task_id: str):
+    """Retrieve full live status and result for an audio transcription task."""
+    task = _AUDIO_TASKS.get(task_id)
+    if not task:
+        # Check disk fallback
+        task_dir = AUDIO_JOBS_DIR / task_id
+        state_file = task_dir / "state.json"
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    task = json.load(f)
+                    _AUDIO_TASKS[task_id] = task
+            except Exception:
+                pass
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Audio task not found.")
+    return task
+
+
+@app.get("/api/audio/{task_id}/events", tags=["audio"])
+async def audio_events_stream(task_id: str):
+    """Server-Sent Events (SSE) live progress stream for audio transcription."""
+    task = _AUDIO_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Audio task not found.")
+
+    if task_id not in _AUDIO_LISTENERS:
+        _AUDIO_LISTENERS[task_id] = []
+    q: asyncio.Queue = asyncio.Queue()
+    _AUDIO_LISTENERS[task_id].append(q)
+
+    async def _event_generator():
+        # Send initial snapshot event
+        yield f"data: {json.dumps({'type': 'snapshot', 'task': task})}\n\n"
+        try:
+            while True:
+                payload = await q.get()
+                yield f"data: {payload}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if task_id in _AUDIO_LISTENERS and q in _AUDIO_LISTENERS[task_id]:
+                _AUDIO_LISTENERS[task_id].remove(q)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/audio/recent", tags=["audio"])
+async def list_recent_audio_tasks():
+    """List recent audio transcription tasks."""
+    tasks = []
+    for t in sorted(_AUDIO_TASKS.values(), key=lambda x: str(x.get("created_at") or ""), reverse=True):
+        tasks.append({
+            "task_id": t.get("task_id"),
+            "filename": t.get("filename"),
+            "base_name": t.get("base_name"),
+            "status": t.get("status"),
+            "stage": t.get("stage"),
+            "progress": t.get("progress", 0),
+            "duration_s": t.get("duration_s", 0),
+            "size_mb": t.get("size_mb", 0),
+            "created_at": t.get("created_at"),
+            "lines_count": t.get("result", {}).get("lines_count", 0) if t.get("result") else 0,
+            "words_count": t.get("result", {}).get("words_count", 0) if t.get("result") else 0,
+        })
+    return tasks
 
 
 @app.get("/api/audio/{task_id}/download", tags=["audio"])
@@ -840,15 +1110,19 @@ async def download_audio_srt(task_id: str, format: str = "srt"):
     if not task_dir.exists():
         raise HTTPException(status_code=404, detail="Audio transcription task not found.")
 
-    meta_file = task_dir / "meta.json"
-    base_name = "audio"
-    if meta_file.exists():
-        try:
-            with open(meta_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-                base_name = meta.get("base_name", "audio")
-        except Exception:
-            pass
+    task = _AUDIO_TASKS.get(task_id) or {}
+    base_name = task.get("base_name")
+    if not base_name:
+        meta_file = task_dir / "meta.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                    base_name = meta.get("base_name", "audio")
+            except Exception:
+                base_name = "audio"
+        else:
+            base_name = "audio"
 
     if format == "txt":
         target = task_dir / "transcript.txt"
@@ -922,15 +1196,8 @@ async def save_audio_file_to_folder(
     dest_dir = Path(dest_dir_str).resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = "audio"
-    meta_file = task_dir / "meta.json"
-    if meta_file.exists():
-        try:
-            with open(meta_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-                base_name = meta.get("base_name", "audio")
-        except Exception:
-            pass
+    task = _AUDIO_TASKS.get(task_id) or {}
+    base_name = task.get("base_name") or "audio"
 
     if format == "txt":
         source_file = task_dir / "transcript.txt"

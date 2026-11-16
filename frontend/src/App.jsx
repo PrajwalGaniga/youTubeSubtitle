@@ -242,12 +242,15 @@ export default function App() {
   const [setupError, setSetupError] = useState('')
 
   // ── Audio to SRT Transcriber State ──
+  const [activeAudioTaskId, setActiveAudioTaskId] = useState(() => localStorage.getItem('ytsub_active_audio_task') || null)
+  const [audioTask, setAudioTask] = useState(null)
+  const [recentAudioTasks, setRecentAudioTasks] = useState([])
   const [audioFile, setAudioFile] = useState(null)
   const [audioSrc, setAudioSrc] = useState(null)
   const [audioDuration, setAudioDuration] = useState(0)
   const [audioVoiceMode, setAudioVoiceMode] = useState('studio') // 'studio' | 'clean' | 'off'
   const [cleanAudioBeforeTranscribe, setCleanAudioBeforeTranscribe] = useState(true)
-  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false)
+  const [audioUploadProgress, setAudioUploadProgress] = useState(null) // { pct, loadedMb, totalMb, speedMb }
   const [audioTranscribeError, setAudioTranscribeError] = useState('')
   const [audioResult, setAudioResult] = useState(null)
   const [audioActiveView, setAudioActiveView] = useState('srt') // 'srt' | 'txt'
@@ -255,6 +258,7 @@ export default function App() {
   const [copiedAudioSrt, setCopiedAudioSrt] = useState(false)
   const [copiedAudioTxt, setCopiedAudioTxt] = useState(false)
   const [isAudioDragging, setIsAudioDragging] = useState(false)
+  const isTranscribingAudio = Boolean((audioTask && audioTask.status === 'running') || audioUploadProgress)
 
   // Styling & Options
   const [selectedPreset, setSelectedPreset] = useState('hormozi-yellow')
@@ -451,12 +455,147 @@ export default function App() {
   }, [job?.logs])
 
   // ---------------------------------------------------------------------------
-  // Audio to SRT Transcriber Handlers
+  // Audio to SRT Transcriber Handlers & Live SSE Tracker
   // ---------------------------------------------------------------------------
+  const fetchRecentAudioTasks = useCallback(async () => {
+    try {
+      const res = await fetch('/api/audio/recent')
+      if (res.ok) {
+        setRecentAudioTasks(await res.json())
+      }
+    } catch (err) {
+      console.warn('Failed to fetch recent audio tasks:', err)
+    }
+  }, [])
+
+  const loadAudioTask = useCallback(async (taskId) => {
+    if (!taskId) return
+    try {
+      const res = await fetch(`/api/audio/${taskId}/status`)
+      if (!res.ok) throw new Error('Task not found')
+      const data = await res.json()
+      setAudioTask(data)
+      setActiveAudioTaskId(taskId)
+      localStorage.setItem('ytsub_active_audio_task', taskId)
+
+      if (data.status === 'done' && data.result) {
+        setAudioResult(data.result)
+        setAudioEditedSrt(data.result.srt || '')
+        setAudioFile({ name: data.filename, size: (data.size_mb || 0) * 1024 * 1024 })
+        setAudioDuration(data.duration_s || 0)
+        setAudioSrc(`/api/audio/${taskId}/audio`)
+      }
+    } catch (err) {
+      console.warn('Failed to load audio task:', err)
+    }
+  }, [])
+
+  // Live SSE connection & polling for active audio task
+  useEffect(() => {
+    if (!activeAudioTaskId) return
+
+    let isCancelled = false
+    let eventSource = null
+    let pollInterval = null
+
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch(`/api/audio/${activeAudioTaskId}/status`)
+        if (res.ok && !isCancelled) {
+          const data = await res.json()
+          setAudioTask(data)
+          if (data.status === 'done' && data.result) {
+            setAudioResult(data.result)
+            setAudioEditedSrt(data.result.srt || '')
+            setAudioFile({ name: data.filename, size: (data.size_mb || 0) * 1024 * 1024 })
+            setAudioDuration(data.duration_s || 0)
+            setAudioSrc(`/api/audio/${activeAudioTaskId}/audio`)
+            fetchRecentAudioTasks()
+            if (pollInterval) clearInterval(pollInterval)
+          } else if (data.status === 'failed') {
+            setAudioTranscribeError(data.error || 'Audio transcription failed.')
+            if (pollInterval) clearInterval(pollInterval)
+          }
+        }
+      } catch (err) {
+        console.warn('Error polling audio status:', err)
+      }
+    }
+
+    fetchStatus()
+
+    try {
+      eventSource = new EventSource(`/api/audio/${activeAudioTaskId}/events`)
+      eventSource.onmessage = (event) => {
+        if (isCancelled) return
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'snapshot' && msg.task) {
+            setAudioTask(msg.task)
+            if (msg.task.status === 'done' && msg.task.result) {
+              setAudioResult(msg.task.result)
+              setAudioEditedSrt(msg.task.result.srt || '')
+              setAudioFile({ name: msg.task.filename, size: (msg.task.size_mb || 0) * 1024 * 1024 })
+              setAudioDuration(msg.task.duration_s || 0)
+              setAudioSrc(`/api/audio/${activeAudioTaskId}/audio`)
+              fetchRecentAudioTasks()
+            }
+          } else if (msg.type === 'progress') {
+            setAudioTask((prev) => ({
+              ...prev,
+              stage: msg.stage,
+              progress: msg.progress,
+              message: msg.message,
+            }))
+          } else if (msg.type === 'done' && msg.result) {
+            setAudioTask((prev) => ({
+              ...prev,
+              status: 'done',
+              stage: 'done',
+              progress: 100,
+              result: msg.result,
+            }))
+            setAudioResult(msg.result)
+            setAudioEditedSrt(msg.result.srt || '')
+            setAudioSrc(`/api/audio/${activeAudioTaskId}/audio`)
+            fetchRecentAudioTasks()
+          } else if (msg.type === 'failed') {
+            setAudioTask((prev) => ({
+              ...prev,
+              status: 'failed',
+              error: msg.error,
+            }))
+            setAudioTranscribeError(msg.error || 'Audio transcription failed.')
+          }
+        } catch (parseErr) {
+          console.warn('SSE parse error:', parseErr)
+        }
+      }
+    } catch (sseErr) {
+      console.warn('SSE setup error:', sseErr)
+    }
+
+    pollInterval = setInterval(fetchStatus, 1500)
+
+    return () => {
+      isCancelled = true
+      if (eventSource) eventSource.close()
+      if (pollInterval) clearInterval(pollInterval)
+    }
+  }, [activeAudioTaskId, fetchRecentAudioTasks])
+
+  // Load recent audio tasks on mount & tab switch
+  useEffect(() => {
+    fetchRecentAudioTasks()
+  }, [fetchRecentAudioTasks, activeTab])
+
   const handleAudioSelect = useCallback((file) => {
     if (!file) return
     setAudioTranscribeError('')
     setAudioResult(null)
+    setAudioTask(null)
+    setActiveAudioTaskId(null)
+    localStorage.removeItem('ytsub_active_audio_task')
 
     const AUDIO_EXTS = ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma', '.m4b', '.webm']
     const isAudio = AUDIO_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext))
@@ -470,7 +609,7 @@ export default function App() {
       return
     }
 
-    if (audioSrc) URL.revokeObjectURL(audioSrc)
+    if (audioSrc && !audioSrc.startsWith('/api/audio/')) URL.revokeObjectURL(audioSrc)
     const url = URL.createObjectURL(file)
     setAudioFile(file)
     setAudioSrc(url)
@@ -482,38 +621,73 @@ export default function App() {
     }
   }, [audioSrc])
 
-  const handleStartAudioTranscribe = useCallback(async () => {
+  const handleStartAudioTranscribe = useCallback(() => {
     if (!audioFile) return
-    setIsTranscribingAudio(true)
     setAudioTranscribeError('')
     setAudioResult(null)
+    setAudioTask(null)
 
     const formData = new FormData()
     formData.append('file', audioFile)
     formData.append('clean_voice', cleanAudioBeforeTranscribe.toString())
     formData.append('voice_mode', audioVoiceMode)
 
-    try {
-      const res = await fetch('/api/audio/transcribe', {
-        method: 'POST',
-        body: formData,
-      })
+    const xhr = new XMLHttpRequest()
+    const startTime = Date.now()
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}))
-        throw new Error(errJson.detail || `Transcription failed with status ${res.status}`)
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100)
+        const loadedMb = (e.loaded / (1024 * 1024)).toFixed(1)
+        const totalMb = (e.total / (1024 * 1024)).toFixed(1)
+        const elapsedSec = (Date.now() - startTime) / 1000
+        const speedMb = elapsedSec > 0 ? (loadedMb / elapsedSec).toFixed(1) : '0'
+
+        setAudioUploadProgress({
+          pct,
+          loadedMb,
+          totalMb,
+          speedMb,
+        })
       }
-
-      const data = await res.json()
-      setAudioResult(data)
-      setAudioEditedSrt(data.srt || '')
-      setAudioActiveView('srt')
-    } catch (err) {
-      console.error('Audio transcription error:', err)
-      setAudioTranscribeError(err.message || 'Audio transcription failed. Please check your Gemini API key or file.')
-    } finally {
-      setIsTranscribingAudio(false)
     }
+
+    xhr.onload = () => {
+      setAudioUploadProgress(null)
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const res = JSON.parse(xhr.responseText)
+          const newTaskId = res.task_id
+          localStorage.setItem('ytsub_active_audio_task', newTaskId)
+          setActiveAudioTaskId(newTaskId)
+          setAudioTask({
+            task_id: newTaskId,
+            status: 'running',
+            stage: 'convert',
+            progress: 15,
+            message: res.message || 'Converting audio stream to 48 kHz broadcast WAV...',
+            filename: audioFile.name,
+          })
+        } catch (parseErr) {
+          setAudioTranscribeError('Failed to parse server response.')
+        }
+      } else {
+        try {
+          const errJson = JSON.parse(xhr.responseText)
+          setAudioTranscribeError(errJson.detail || `Upload failed (${xhr.status})`)
+        } catch {
+          setAudioTranscribeError(`Upload failed with HTTP status ${xhr.status}`)
+        }
+      }
+    }
+
+    xhr.onerror = () => {
+      setAudioUploadProgress(null)
+      setAudioTranscribeError('Network connection failed during audio upload.')
+    }
+
+    xhr.open('POST', '/api/audio/transcribe')
+    xhr.send(formData)
   }, [audioFile, cleanAudioBeforeTranscribe, audioVoiceMode])
 
   const handleDownloadAudioSrt = useCallback(() => {
@@ -557,13 +731,17 @@ export default function App() {
   }, [audioResult])
 
   const handleResetAudioTranscribe = useCallback(() => {
-    if (audioSrc) URL.revokeObjectURL(audioSrc)
+    if (audioSrc && !audioSrc.startsWith('/api/audio/')) URL.revokeObjectURL(audioSrc)
     setAudioFile(null)
     setAudioSrc(null)
     setAudioDuration(0)
     setAudioResult(null)
+    setAudioTask(null)
+    setActiveAudioTaskId(null)
+    localStorage.removeItem('ytsub_active_audio_task')
     setAudioEditedSrt('')
     setAudioTranscribeError('')
+    setAudioUploadProgress(null)
   }, [audioSrc])
 
   // ---------------------------------------------------------------------------
@@ -2299,7 +2477,7 @@ export default function App() {
             </div>
 
             {/* View A: No audio file selected yet -> Dropzone */}
-            {!audioFile && (
+            {!audioFile && !audioTask && !audioResult && (
               <label
                 htmlFor="audioFileInput"
                 className={`${styles.audioDropzone} ${isAudioDragging ? styles.audioDropzoneDragging : ''}`}
@@ -2433,15 +2611,120 @@ export default function App() {
               </div>
             )}
 
-            {/* View C: Actively Transcribing with Gemini */}
-            {isTranscribingAudio && (
+            {/* View C1: Real-Time Audio Upload Progress */}
+            {audioUploadProgress && (
               <div className={styles.audioProcessingCard}>
                 <div className={styles.audioSpinWrap}>
                   <RefreshCw size={28} className={styles.spin} />
                 </div>
-                <div className={styles.audioProcessingTitle}>Transcribing Audio to SRT...</div>
+                <div className={styles.audioProcessingTitle}>
+                  Uploading Audio Stream...
+                </div>
+                <div className={styles.audioProgressBarTrack}>
+                  <div
+                    className={styles.audioProgressBarFill}
+                    style={{ width: `${Math.max(5, audioUploadProgress.pct || 0)}%` }}
+                  />
+                </div>
+                <div className={styles.audioProgressMetaRow}>
+                  <span>
+                    {audioUploadProgress.loadedMb} MB / {audioUploadProgress.totalMb} MB transferred ({audioUploadProgress.speedMb} MB/s)
+                  </span>
+                  <span className={styles.audioProgressPct}>{audioUploadProgress.pct}%</span>
+                </div>
                 <div className={styles.audioProcessingDesc}>
-                  Gemini AI is listening to your audio track, segmenting speech into conversational chunks, and generating millisecond-precise timestamps. This typically takes 5–15 seconds.
+                  Streaming audio directly to FastAPI server. Studio pipeline initializes immediately upon completion.
+                </div>
+              </div>
+            )}
+
+            {/* View C2: Multi-Stage Asynchronous Gemini Transcription Progress */}
+            {audioTask && audioTask.status === 'running' && !audioUploadProgress && (
+              <div className={styles.audioProcessingCard}>
+                <div className={styles.audioSpinWrap}>
+                  <RefreshCw size={28} className={styles.spin} />
+                </div>
+                <div className={styles.audioProcessingTitle}>
+                  Transcribing Audio with Gemini AI...
+                </div>
+                <div className={styles.audioProgressBarTrack}>
+                  <div
+                    className={styles.audioProgressBarFill}
+                    style={{ width: `${Math.max(8, Math.min(100, Math.round(audioTask.progress || 15)))}%` }}
+                  />
+                </div>
+                <div className={styles.audioProgressMetaRow}>
+                  <span>{audioTask.message || 'Processing audio stream...'}</span>
+                  <span className={styles.audioProgressPct}>{Math.round(audioTask.progress || 15)}%</span>
+                </div>
+
+                {/* Multi-Stage Visual Cards */}
+                <div className={styles.audioStagesGrid}>
+                  <div
+                    className={`${styles.audioStageCard} ${
+                      (audioTask.progress || 0) > 25
+                        ? styles.audioStageCardDone
+                        : audioTask.stage === 'convert'
+                        ? styles.audioStageCardActive
+                        : ''
+                    }`}
+                  >
+                    <div className={styles.audioStageHeader}>
+                      <span className={styles.audioStageTitle}>1. Convert Stream</span>
+                      {(audioTask.progress || 0) > 25 ? (
+                        <CheckCircle2 size={15} color="#86EFAC" />
+                      ) : audioTask.stage === 'convert' ? (
+                        <RefreshCw size={13} className={styles.spin} color="#38BDF8" />
+                      ) : (
+                        <Clock size={13} color="var(--text-faint)" />
+                      )}
+                    </div>
+                    <div className={styles.audioStageDesc}>FFmpeg 48 kHz mono extraction</div>
+                  </div>
+
+                  <div
+                    className={`${styles.audioStageCard} ${
+                      (audioTask.progress || 0) > 65
+                        ? styles.audioStageCardDone
+                        : audioTask.stage === 'enhance'
+                        ? styles.audioStageCardActive
+                        : ''
+                    }`}
+                  >
+                    <div className={styles.audioStageHeader}>
+                      <span className={styles.audioStageTitle}>2. RNNoise Denoise</span>
+                      {(audioTask.progress || 0) > 65 ? (
+                        <CheckCircle2 size={15} color="#86EFAC" />
+                      ) : audioTask.stage === 'enhance' ? (
+                        <RefreshCw size={13} className={styles.spin} color="#38BDF8" />
+                      ) : (
+                        <Clock size={13} color="var(--text-faint)" />
+                      )}
+                    </div>
+                    <div className={styles.audioStageDesc}>Neural speech isolation &amp; EQ</div>
+                  </div>
+
+                  <div
+                    className={`${styles.audioStageCard} ${
+                      (audioTask.progress || 0) >= 95
+                        ? styles.audioStageCardDone
+                        : audioTask.stage === 'transcribe'
+                        ? styles.audioStageCardActive
+                        : ''
+                    }`}
+                  >
+                    <div className={styles.audioStageHeader}>
+                      <span className={styles.audioStageTitle}>3. Gemini AI</span>
+                      {(audioTask.progress || 0) >= 95 ? (
+                        <CheckCircle2 size={15} color="#86EFAC" />
+                      ) : audioTask.stage === 'transcribe' ? (
+                        <RefreshCw size={13} className={styles.spin} color="#38BDF8" />
+                      ) : (
+                        <Clock size={13} color="var(--text-faint)" />
+                      )}
+                    </div>
+                    <div className={styles.audioStageDesc}>Romanized Hinglish timestamps</div>
+                  </div>
                 </div>
               </div>
             )}
@@ -2586,6 +2869,65 @@ export default function App() {
                     {audioResult.transcript || 'No plain transcript available.'}
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* View E: Recent Audio Subtitle Transcripts Drawer */}
+            {recentAudioTasks && recentAudioTasks.length > 0 && (
+              <div className={styles.recentAudioSection}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <div>
+                    <h4 className={styles.sectionTitle} style={{ fontSize: '1.05rem', margin: 0 }}>
+                      <Clock size={17} color="#38BDF8" /> Recent Audio Subtitle Transcripts ({recentAudioTasks.length})
+                    </h4>
+                    <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      Click any past audio transcription below to review, listen, edit, or download its .SRT
+                    </span>
+                  </div>
+                </div>
+
+                <div className={styles.recentAudioGrid}>
+                  {recentAudioTasks.map((t) => {
+                    const isCurrent = activeAudioTaskId === t.task_id
+                    return (
+                      <div
+                        key={t.task_id}
+                        className={`${styles.recentAudioCard} ${isCurrent ? styles.recentAudioCardActive : ''}`}
+                        onClick={() => loadAudioTask(t.task_id)}
+                        title="Click to load this transcript"
+                      >
+                        <div className={styles.recentAudioTitleRow}>
+                          <span className={styles.recentAudioFileName}>{t.filename || 'Audio File'}</span>
+                          <span
+                            style={{
+                              fontSize: '0.7rem',
+                              padding: '2px 8px',
+                              borderRadius: 999,
+                              fontWeight: 600,
+                              background: t.status === 'done' ? 'rgba(134, 239, 172, 0.15)' : 'rgba(56, 189, 248, 0.15)',
+                              color: t.status === 'done' ? '#86EFAC' : '#38BDF8',
+                              border: `1px solid ${t.status === 'done' ? 'rgba(134, 239, 172, 0.3)' : 'rgba(56, 189, 248, 0.3)'}`,
+                            }}
+                          >
+                            {t.status === 'done' ? 'Completed' : 'Processing'}
+                          </span>
+                        </div>
+
+                        <div className={styles.recentAudioMetaRow}>
+                          {t.lines_count > 0 && <span><strong>{t.lines_count}</strong> lines</span>}
+                          {t.words_count > 0 && <span>• <strong>{t.words_count}</strong> words</span>}
+                          {t.duration_s > 0 && <span>• {fmtSec(t.duration_s)}</span>}
+                        </div>
+
+                        {t.created_at && (
+                          <div style={{ fontSize: '0.7rem', color: 'var(--text-faint)', marginTop: 2 }}>
+                            🕒 {formatIST(t.created_at)}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
             )}
           </div>

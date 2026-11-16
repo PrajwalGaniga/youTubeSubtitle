@@ -6,6 +6,8 @@ backend/.env
 # Job storage & temporary processed files
 backend/jobs/*
 !backend/jobs/.gitkeep
+backend/audio_jobs/*
+!backend/audio_jobs/.gitkeep
 
 # Media files & test outputs
 *.mp4
@@ -37,3 +39,4 @@ yarn-error.log*
 .gemini/
 .system_generated/
 scratch/
+*.code-workspace
