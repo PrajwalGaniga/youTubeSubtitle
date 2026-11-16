@@ -13,10 +13,12 @@ Features:
 
 from __future__ import annotations
 import asyncio
+import json
 import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -25,8 +27,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from ass_generator import PRESETS
+from audio_processor import clean_audio, extract_audio
 from config import FFMPEG_PATH, FFPROBE_PATH, GEMINI_API_KEY, GEMINI_MODEL, JOBS_DIR, MAX_UPLOAD_BYTES
-from video_burner import extract_video_thumbnail, reformat_video_aspect
+from transcriber import transcribe
+from video_burner import extract_video_thumbnail, probe_video_duration, reformat_video_aspect
 from job_manager import (
     attach_background_music,
     cancel_job_execution,
@@ -682,6 +686,271 @@ async def get_job_thumbnail(job_id: str):
 async def list_jobs_history():
     """List recent and historical projects."""
     return list_all_jobs()
+
+
+# ---------------------------------------------------------------------------
+# Audio to SRT Transcription Endpoints
+# ---------------------------------------------------------------------------
+AUDIO_JOBS_DIR = Path(__file__).parent / "audio_jobs"
+AUDIO_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma", ".m4b", ".webm"
+}
+
+
+@app.post("/api/audio/transcribe", tags=["audio"])
+async def transcribe_audio_file(
+    file: UploadFile = File(..., description="Audio file (.mp3, .wav, .m4a, .aac, .flac, etc.)"),
+    clean_voice: bool = Form(True),
+    voice_mode: str = Form("studio"),
+):
+    """
+    Directly transcribe any uploaded audio file to a complete timestamped SRT subtitle file.
+    Optionally applies RNNoise neural voice cleaning and studio EQ before transcribing.
+    """
+    filename = file.filename or "audio.mp3"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio format '{ext}'. Accepted formats: {', '.join(sorted(AUDIO_EXTENSIONS))}",
+        )
+
+    task_id = uuid.uuid4().hex[:8]
+    task_dir = AUDIO_JOBS_DIR / f"audio_{task_id}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    input_audio_path = task_dir / f"input{ext}"
+    raw_wav_path = task_dir / "raw_audio.wav"
+    clean_wav_path = task_dir / "clean_audio.wav"
+    srt_path = task_dir / "subs.srt"
+    transcript_path = task_dir / "transcript.txt"
+    meta_path = task_dir / "meta.json"
+
+    # Stream upload file to disk and enforce size limit
+    total_bytes = 0
+    try:
+        with open(input_audio_path, "wb") as f_out:
+            while chunk := await file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    f_out.close()
+                    shutil.rmtree(task_dir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Audio file exceeds maximum size limit of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                    )
+                f_out.write(chunk)
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}")
+
+    try:
+        # Convert audio to mono 48 kHz 16-bit PCM WAV via FFmpeg
+        await asyncio.to_thread(extract_audio, str(input_audio_path), str(raw_wav_path), 48000)
+        dur = await asyncio.to_thread(probe_video_duration, str(raw_wav_path))
+
+        # Optional audio cleaning (RNNoise + Studio EQ)
+        audio_for_transcribe = str(raw_wav_path)
+        if clean_voice and voice_mode != "off":
+            try:
+                await asyncio.to_thread(clean_audio, str(raw_wav_path), str(clean_wav_path), voice_mode)
+                if clean_wav_path.exists() and clean_wav_path.stat().st_size > 0:
+                    audio_for_transcribe = str(clean_wav_path)
+            except Exception as clean_err:
+                print(f"[audio_transcribe] Audio cleaning warning: {clean_err}")
+                audio_for_transcribe = str(raw_wav_path)
+
+        # Transcribe with Gemini
+        await asyncio.to_thread(transcribe, audio_for_transcribe, str(srt_path))
+
+        if not srt_path.exists() or srt_path.stat().st_size == 0:
+            raise RuntimeError("Gemini did not generate an SRT file.")
+
+        with open(srt_path, "r", encoding="utf-8", errors="replace") as f_srt:
+            srt_content = f_srt.read()
+
+        # Parse subtitle lines & words count
+        lines_count = 0
+        words_count = 0
+        transcript_lines = []
+        for line in srt_content.splitlines():
+            l = line.strip()
+            if l and not l.isdigit() and "-->" not in l:
+                lines_count += 1
+                words_count += len(l.split())
+                transcript_lines.append(l)
+
+        transcript_text = "\n".join(transcript_lines)
+        with open(transcript_path, "w", encoding="utf-8") as f_txt:
+            f_txt.write(transcript_text)
+
+        base_name = os.path.splitext(filename)[0]
+        meta = {
+            "task_id": f"audio_{task_id}",
+            "filename": filename,
+            "base_name": base_name,
+            "duration_s": round(dur, 1),
+            "lines_count": lines_count,
+            "words_count": words_count,
+            "size_mb": round(total_bytes / (1024 * 1024), 2),
+            "cleaned": bool(clean_voice and voice_mode != "off"),
+            "voice_mode": voice_mode if clean_voice else "off",
+        }
+        with open(meta_path, "w", encoding="utf-8") as f_meta:
+            json.dump(meta, f_meta, indent=2)
+
+        return {
+            "success": True,
+            "task_id": f"audio_{task_id}",
+            "filename": filename,
+            "base_name": base_name,
+            "duration_s": round(dur, 1),
+            "lines_count": lines_count,
+            "words_count": words_count,
+            "size_mb": round(total_bytes / (1024 * 1024), 2),
+            "srt": srt_content,
+            "transcript": transcript_text,
+            "cleaned": bool(clean_voice and voice_mode != "off"),
+            "voice_mode": voice_mode if clean_voice else "off",
+            "download_url": f"/api/audio/audio_{task_id}/download?format=srt",
+            "txt_download_url": f"/api/audio/audio_{task_id}/download?format=txt",
+            "audio_url": f"/api/audio/audio_{task_id}/audio",
+        }
+
+    except Exception as exc:
+        print(f"[audio_transcribe] Transcription error: {exc}")
+        err_msg = str(exc)
+        if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg.lower():
+            err_msg = "Gemini AI servers are temporarily busy (503). Please try again in a few moments."
+        elif "429" in err_msg or "quota" in err_msg.lower():
+            err_msg = "Gemini API rate limit reached (429). Please wait a moment and retry."
+        elif "valid SRT" in err_msg:
+            err_msg = "Could not detect clear speech in this audio recording. Please verify that the audio contains spoken words."
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {err_msg}")
+
+
+@app.get("/api/audio/{task_id}/download", tags=["audio"])
+async def download_audio_srt(task_id: str, format: str = "srt"):
+    """Download the generated SRT or TXT transcript."""
+    task_dir = AUDIO_JOBS_DIR / task_id
+    if not task_dir.exists():
+        raise HTTPException(status_code=404, detail="Audio transcription task not found.")
+
+    meta_file = task_dir / "meta.json"
+    base_name = "audio"
+    if meta_file.exists():
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                base_name = meta.get("base_name", "audio")
+        except Exception:
+            pass
+
+    if format == "txt":
+        target = task_dir / "transcript.txt"
+        out_name = f"{base_name}_transcript.txt"
+        media_type = "text/plain; charset=utf-8"
+    else:
+        target = task_dir / "subs.srt"
+        out_name = f"{base_name}_subtitles.srt"
+        media_type = "text/plain; charset=utf-8"
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found for format '{format}'.")
+
+    return FileResponse(
+        path=str(target),
+        media_type=media_type,
+        filename=out_name,
+    )
+
+
+@app.get("/api/audio/{task_id}/audio", tags=["audio"])
+async def stream_task_audio(task_id: str):
+    """Stream audio file for playback in the web player."""
+    task_dir = AUDIO_JOBS_DIR / task_id
+    if not task_dir.exists():
+        raise HTTPException(status_code=404, detail="Audio transcription task not found.")
+
+    candidates = list(task_dir.glob("input.*"))
+    if candidates and candidates[0].exists():
+        target = candidates[0]
+    else:
+        target = task_dir / "raw_audio.wav"
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found.")
+
+    ext = target.suffix.lower()
+    media_types = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+    }
+    media_type = media_types.get(ext, "audio/mpeg")
+
+    return FileResponse(
+        path=str(target),
+        media_type=media_type,
+        filename=target.name,
+    )
+
+
+@app.post("/api/audio/{task_id}/save-to-folder", tags=["audio"])
+async def save_audio_file_to_folder(
+    task_id: str,
+    folder_path: str = Form(...),
+    custom_filename: Optional[str] = Form(None),
+    format: str = Form("srt"),
+):
+    """Export and save the generated SRT or TXT directly into a specified local folder on PC."""
+    task_dir = AUDIO_JOBS_DIR / task_id
+    if not task_dir.exists():
+        raise HTTPException(status_code=404, detail="Audio transcription task not found.")
+
+    dest_dir_str = folder_path.strip().strip('"').strip("'")
+    if not dest_dir_str:
+        raise HTTPException(status_code=400, detail="Destination folder path is required.")
+
+    dest_dir = Path(dest_dir_str).resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    base_name = "audio"
+    meta_file = task_dir / "meta.json"
+    if meta_file.exists():
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                base_name = meta.get("base_name", "audio")
+        except Exception:
+            pass
+
+    if format == "txt":
+        source_file = task_dir / "transcript.txt"
+        out_filename = custom_filename or f"{base_name}_transcript.txt"
+    else:
+        source_file = task_dir / "subs.srt"
+        out_filename = custom_filename or f"{base_name}_subtitles.srt"
+
+    if not source_file.exists():
+        raise HTTPException(status_code=404, detail="Transcript file not found.")
+
+    dest_file = dest_dir / out_filename
+    shutil.copy2(source_file, dest_file)
+    return {
+        "success": True,
+        "filename": out_filename,
+        "folder_path": str(dest_dir),
+        "full_path": str(dest_file),
+        "size_kb": round(dest_file.stat().st_size / 1024, 2),
+    }
 
 
 # ---------------------------------------------------------------------------

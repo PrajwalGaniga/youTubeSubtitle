@@ -9,10 +9,12 @@ import {
   Copy,
   Download,
   FastForward,
+  FileText,
   Film,
   FolderOpen,
   Headphones,
   Maximize2,
+  Mic,
   Music,
   Palette,
   Pause,
@@ -239,6 +241,21 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState(null) // { pct, loadedMb, totalMb, speedMb }
   const [setupError, setSetupError] = useState('')
 
+  // ── Audio to SRT Transcriber State ──
+  const [audioFile, setAudioFile] = useState(null)
+  const [audioSrc, setAudioSrc] = useState(null)
+  const [audioDuration, setAudioDuration] = useState(0)
+  const [audioVoiceMode, setAudioVoiceMode] = useState('studio') // 'studio' | 'clean' | 'off'
+  const [cleanAudioBeforeTranscribe, setCleanAudioBeforeTranscribe] = useState(true)
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false)
+  const [audioTranscribeError, setAudioTranscribeError] = useState('')
+  const [audioResult, setAudioResult] = useState(null)
+  const [audioActiveView, setAudioActiveView] = useState('srt') // 'srt' | 'txt'
+  const [audioEditedSrt, setAudioEditedSrt] = useState('')
+  const [copiedAudioSrt, setCopiedAudioSrt] = useState(false)
+  const [copiedAudioTxt, setCopiedAudioTxt] = useState(false)
+  const [isAudioDragging, setIsAudioDragging] = useState(false)
+
   // Styling & Options
   const [selectedPreset, setSelectedPreset] = useState('hormozi-yellow')
   const [autoPilot, setAutoPilot] = useState(true)
@@ -434,14 +451,138 @@ export default function App() {
   }, [job?.logs])
 
   // ---------------------------------------------------------------------------
+  // Audio to SRT Transcriber Handlers
+  // ---------------------------------------------------------------------------
+  const handleAudioSelect = useCallback((file) => {
+    if (!file) return
+    setAudioTranscribeError('')
+    setAudioResult(null)
+
+    const AUDIO_EXTS = ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma', '.m4b', '.webm']
+    const isAudio = AUDIO_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext))
+    if (!isAudio) {
+      setAudioTranscribeError('Please select a valid audio file (.mp3, .wav, .m4a, .aac, .flac, .ogg, etc.)')
+      return
+    }
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setAudioTranscribeError(`File is ${fmtSize(file.size)}. Limit is ${MAX_UPLOAD_MB} MB.`)
+      return
+    }
+
+    if (audioSrc) URL.revokeObjectURL(audioSrc)
+    const url = URL.createObjectURL(file)
+    setAudioFile(file)
+    setAudioSrc(url)
+
+    const tempAudio = document.createElement('audio')
+    tempAudio.src = url
+    tempAudio.onloadedmetadata = () => {
+      setAudioDuration(tempAudio.duration || 0)
+    }
+  }, [audioSrc])
+
+  const handleStartAudioTranscribe = useCallback(async () => {
+    if (!audioFile) return
+    setIsTranscribingAudio(true)
+    setAudioTranscribeError('')
+    setAudioResult(null)
+
+    const formData = new FormData()
+    formData.append('file', audioFile)
+    formData.append('clean_voice', cleanAudioBeforeTranscribe.toString())
+    formData.append('voice_mode', audioVoiceMode)
+
+    try {
+      const res = await fetch('/api/audio/transcribe', {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}))
+        throw new Error(errJson.detail || `Transcription failed with status ${res.status}`)
+      }
+
+      const data = await res.json()
+      setAudioResult(data)
+      setAudioEditedSrt(data.srt || '')
+      setAudioActiveView('srt')
+    } catch (err) {
+      console.error('Audio transcription error:', err)
+      setAudioTranscribeError(err.message || 'Audio transcription failed. Please check your Gemini API key or file.')
+    } finally {
+      setIsTranscribingAudio(false)
+    }
+  }, [audioFile, cleanAudioBeforeTranscribe, audioVoiceMode])
+
+  const handleDownloadAudioSrt = useCallback(() => {
+    if (!audioResult) return
+    const contentToDownload = audioEditedSrt || audioResult.srt
+    const fileName = `${audioResult.base_name || 'audio'}_subtitles.srt`
+
+    const blob = new Blob([contentToDownload], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    downloadWithSavePicker(url, fileName).finally(() => {
+      URL.revokeObjectURL(url)
+    })
+  }, [audioResult, audioEditedSrt])
+
+  const handleDownloadAudioTxt = useCallback(() => {
+    if (!audioResult) return
+    const fileName = `${audioResult.base_name || 'audio'}_transcript.txt`
+    const blob = new Blob([audioResult.transcript || ''], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    downloadWithSavePicker(url, fileName).finally(() => {
+      URL.revokeObjectURL(url)
+    })
+  }, [audioResult])
+
+  const handleCopyAudioSrt = useCallback(() => {
+    const text = audioEditedSrt || audioResult?.srt || ''
+    if (!text) return
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedAudioSrt(true)
+      setTimeout(() => setCopiedAudioSrt(false), 2200)
+    })
+  }, [audioEditedSrt, audioResult])
+
+  const handleCopyAudioTxt = useCallback(() => {
+    const text = audioResult?.transcript || ''
+    if (!text) return
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedAudioTxt(true)
+      setTimeout(() => setCopiedAudioTxt(false), 2200)
+    })
+  }, [audioResult])
+
+  const handleResetAudioTranscribe = useCallback(() => {
+    if (audioSrc) URL.revokeObjectURL(audioSrc)
+    setAudioFile(null)
+    setAudioSrc(null)
+    setAudioDuration(0)
+    setAudioResult(null)
+    setAudioEditedSrt('')
+    setAudioTranscribeError('')
+  }, [audioSrc])
+
+  // ---------------------------------------------------------------------------
   // File Validation & Preview Loading
   // ---------------------------------------------------------------------------
   const handleFileSelect = useCallback((file) => {
     if (!file) return
     setSetupError('')
 
+    const AUDIO_EXTS = ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma', '.m4b', '.webm']
+    const isAudio = AUDIO_EXTS.some((ext) => file.name.toLowerCase().endsWith(ext))
+    if (isAudio) {
+      handleAudioSelect(file)
+      setActiveTab('audio')
+      return
+    }
+
     if (!file.name.toLowerCase().endsWith('.mp4')) {
-      setSetupError('Only .mp4 video files are supported.')
+      setSetupError('Only .mp4 video files are supported. To transcribe an audio recording, switch to the Audio to SRT tab.')
       return
     }
 
@@ -953,6 +1094,13 @@ export default function App() {
           </button>
           <button
             type="button"
+            className={`${styles.navTabBtn} ${activeTab === 'audio' ? styles.navTabActive : ''}`}
+            onClick={() => setActiveTab('audio')}
+          >
+            <Headphones size={15} /> Audio to SRT
+          </button>
+          <button
+            type="button"
             className={`${styles.navTabBtn} ${activeTab === 'projects' ? styles.navTabActive : ''}`}
             onClick={() => {
               setActiveTab('projects')
@@ -1044,7 +1192,7 @@ export default function App() {
                       <input
                         id="studioFileInput"
                         type="file"
-                        accept="video/mp4,.mp4"
+                        accept="video/mp4,.mp4,audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma,.m4b,.webm"
                         className={styles.fileInputHidden}
                         onChange={(e) => {
                           if (e.target.files?.[0]) handleFileSelect(e.target.files[0])
@@ -1062,6 +1210,29 @@ export default function App() {
                         <span className={styles.pill}>🎙️ Neural Voice Enhancement</span>
                         <span className={styles.pill}>⚡ Word-by-Word Kinetic Pop</span>
                         <span className={styles.pill}>📝 English / Hinglish</span>
+                      </div>
+                      <div style={{ marginTop: 16, fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                        Looking to transcribe an audio file only?{' '}
+                        <button
+                          type="button"
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: 'var(--accent-cyan)',
+                            textDecoration: 'underline',
+                            cursor: 'pointer',
+                            padding: 0,
+                            fontSize: '0.8rem',
+                            fontWeight: 600,
+                          }}
+                          onClick={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            setActiveTab('audio')
+                          }}
+                        >
+                          Switch to Audio to SRT →
+                        </button>
                       </div>
                     </label>
                   ) : (
@@ -2113,7 +2284,315 @@ export default function App() {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════
-            TAB 2: PROJECTS / HISTORY
+            TAB 2: AUDIO TO SRT TRANSCRIBER
+           ═══════════════════════════════════════════════════════════════════ */}
+        {activeTab === 'audio' && (
+          <div className={styles.audioContainer}>
+            {/* Header info */}
+            <div style={{ marginBottom: 24 }}>
+              <h3 className={styles.sectionTitle} style={{ fontSize: '1.3rem', marginBottom: 6 }}>
+                <Headphones size={24} color="#38BDF8" /> Audio to SRT Transcriber
+              </h3>
+              <p className={styles.sectionSubtitle}>
+                Upload any audio file (MP3, WAV, M4A, AAC, FLAC, etc.) to get a complete timestamped .SRT subtitle file powered by Gemini AI.
+              </p>
+            </div>
+
+            {/* View A: No audio file selected yet -> Dropzone */}
+            {!audioFile && (
+              <label
+                htmlFor="audioFileInput"
+                className={`${styles.audioDropzone} ${isAudioDragging ? styles.audioDropzoneDragging : ''}`}
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  setIsAudioDragging(true)
+                }}
+                onDragLeave={() => setIsAudioDragging(false)}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  setIsAudioDragging(false)
+                  if (e.dataTransfer.files?.[0]) handleAudioSelect(e.dataTransfer.files[0])
+                }}
+              >
+                <input
+                  id="audioFileInput"
+                  type="file"
+                  accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma,.m4b,.webm"
+                  className={styles.fileInputHidden}
+                  onChange={(e) => {
+                    if (e.target.files?.[0]) handleAudioSelect(e.target.files[0])
+                    e.target.value = ''
+                  }}
+                />
+                <div className={styles.audioDropzoneIconWrap}>
+                  <Headphones size={36} />
+                </div>
+                <h3 className={styles.audioDropzoneTitle}>Drop your Audio file here</h3>
+                <p className={styles.audioDropzoneSubtitle}>
+                  Supports MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, WMA up to 300 MB
+                </p>
+                <div className={styles.audioDropzonePills}>
+                  <span className={styles.pill}>⚡ Gemini AI Speech Recognition</span>
+                  <span className={styles.pill}>🎙️ Romanized Hinglish &amp; English</span>
+                  <span className={styles.pill}>⏱️ Millisecond Accurate Timestamps</span>
+                </div>
+              </label>
+            )}
+
+            {/* Error Message */}
+            {audioTranscribeError && (
+              <div className={styles.setupErrorCard} style={{ marginTop: 16 }}>
+                <AlertCircle size={18} />
+                <span>{audioTranscribeError}</span>
+              </div>
+            )}
+
+            {/* View B: Audio Selected, but Not Transcribed Yet */}
+            {audioFile && !audioResult && !isTranscribingAudio && (
+              <div className={styles.audioFileCard}>
+                <div className={styles.audioHeaderRow}>
+                  <div className={styles.audioFileInfo}>
+                    <div className={styles.audioIconBadge}>
+                      <Headphones size={24} />
+                    </div>
+                    <div>
+                      <div className={styles.audioFileName}>{audioFile.name}</div>
+                      <div className={styles.audioMetaChips}>
+                        <span className={styles.audioChip}>{fmtSize(audioFile.size)}</span>
+                        {audioDuration > 0 && (
+                          <span className={styles.audioChip}>Duration: {fmtSec(audioDuration)}</span>
+                        )}
+                        <span className={`${styles.audioChip} ${styles.metaChipCyan}`}>Ready to Transcribe</span>
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={styles.replaceBtn}
+                    onClick={handleResetAudioTranscribe}
+                  >
+                    Change Audio
+                  </button>
+                </div>
+
+                {/* Built-in Audio Player Preview */}
+                {audioSrc && (
+                  <div className={styles.audioPlayerWrap}>
+                    <audio src={audioSrc} controls className={styles.audioPlayerEl} />
+                  </div>
+                )}
+
+                {/* Options: AI Noise Reduction & Mode */}
+                <div className={styles.audioOptionsCard}>
+                  <div className={styles.audioOptionHeader}>
+                    <span className={styles.audioOptionTitle}>
+                      <Sparkles size={16} color="#38BDF8" /> Voice Enhancement Pre-Filter
+                    </span>
+                    <label className={styles.checkboxLabel} style={{ margin: 0 }}>
+                      <input
+                        type="checkbox"
+                        checked={cleanAudioBeforeTranscribe}
+                        onChange={(e) => setCleanAudioBeforeTranscribe(e.target.checked)}
+                      />
+                      <span>Enable Cleanup</span>
+                    </label>
+                  </div>
+                  <p className={styles.audioOptionDesc}>
+                    Cleans background hum, AC drone, and room reverb using RNNoise neural network to ensure Gemini achieves maximum subtitle accuracy.
+                  </p>
+
+                  {cleanAudioBeforeTranscribe && (
+                    <div className={styles.audioModesRow}>
+                      {[
+                        { id: 'studio', label: '🎙️ Studio Podcast' },
+                        { id: 'clean', label: '🌿 Natural Clean' },
+                        { id: 'off', label: '🔈 Raw Audio' },
+                      ].map((m) => (
+                        <button
+                          key={m.id}
+                          type="button"
+                          className={`${styles.audioModeBtn} ${audioVoiceMode === m.id ? styles.audioModeBtnActive : ''}`}
+                          onClick={() => setAudioVoiceMode(m.id)}
+                        >
+                          {audioVoiceMode === m.id && <Check size={13} />}
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Big Action CTA */}
+                <button
+                  type="button"
+                  className={styles.transcribeCtaBtn}
+                  onClick={handleStartAudioTranscribe}
+                >
+                  <Zap size={18} /> Transcribe Audio to Complete SRT
+                </button>
+              </div>
+            )}
+
+            {/* View C: Actively Transcribing with Gemini */}
+            {isTranscribingAudio && (
+              <div className={styles.audioProcessingCard}>
+                <div className={styles.audioSpinWrap}>
+                  <RefreshCw size={28} className={styles.spin} />
+                </div>
+                <div className={styles.audioProcessingTitle}>Transcribing Audio to SRT...</div>
+                <div className={styles.audioProcessingDesc}>
+                  Gemini AI is listening to your audio track, segmenting speech into conversational chunks, and generating millisecond-precise timestamps. This typically takes 5–15 seconds.
+                </div>
+              </div>
+            )}
+
+            {/* View D: Complete Result View */}
+            {audioResult && (
+              <div className={styles.audioResultCard}>
+                {/* Result Header & Actions */}
+                <div className={styles.audioResultHeader}>
+                  <div>
+                    <div className={styles.audioSuccessBadge}>
+                      <CheckCircle2 size={22} color="#86EFAC" /> SRT Subtitles Generated Successfully!
+                    </div>
+                    <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: 4 }}>
+                      Source: <strong>{audioResult.filename}</strong>
+                    </div>
+                  </div>
+
+                  <div className={styles.audioResultActionsRow}>
+                    <button
+                      type="button"
+                      className={styles.primaryBtn}
+                      style={{ height: 38, padding: '0 16px', gap: 6, fontSize: '0.82rem' }}
+                      onClick={handleDownloadAudioSrt}
+                      title="Download .srt subtitle file"
+                    >
+                      <Download size={14} /> Download .SRT
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.secondaryBtn}
+                      style={{ height: 38, padding: '0 14px', gap: 6, fontSize: '0.82rem' }}
+                      onClick={handleDownloadAudioTxt}
+                      title="Download plain text transcript"
+                    >
+                      <Download size={14} /> Download .TXT
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.secondaryBtn}
+                      style={{ height: 38, padding: '0 12px', gap: 6, fontSize: '0.82rem' }}
+                      onClick={handleCopyAudioSrt}
+                      title="Copy complete SRT text to clipboard"
+                    >
+                      {copiedAudioSrt ? <Check size={14} color="#86EFAC" /> : <Copy size={14} />}
+                      {copiedAudioSrt ? 'Copied SRT!' : 'Copy SRT'}
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.secondaryBtn}
+                      style={{ height: 38, padding: '0 12px', gap: 6, fontSize: '0.82rem' }}
+                      onClick={handleCopyAudioTxt}
+                      title="Copy plain dialogue text to clipboard"
+                    >
+                      {copiedAudioTxt ? <Check size={14} color="#86EFAC" /> : <Copy size={14} />}
+                      {copiedAudioTxt ? 'Copied Text!' : 'Copy Text'}
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.secondaryBtn}
+                      style={{ height: 38, padding: '0 12px', gap: 6, fontSize: '0.82rem' }}
+                      onClick={handleResetAudioTranscribe}
+                      title="Transcribe another audio file"
+                    >
+                      <RotateCcw size={14} /> New Audio
+                    </button>
+                  </div>
+                </div>
+
+                {/* Metrics Row */}
+                <div className={styles.audioResultMetricsRow}>
+                  <div className={styles.audioResultMetricBadge}>
+                    <span>Subtitles:</span>
+                    <strong>{audioResult.lines_count} lines</strong>
+                  </div>
+                  <div className={styles.audioResultMetricBadge}>
+                    <span>Words:</span>
+                    <strong>{audioResult.words_count} words</strong>
+                  </div>
+                  {audioResult.duration_s > 0 && (
+                    <div className={styles.audioResultMetricBadge}>
+                      <span>Duration:</span>
+                      <strong>{fmtSec(audioResult.duration_s)}</strong>
+                    </div>
+                  )}
+                  <div className={styles.audioResultMetricBadge}>
+                    <span>Language:</span>
+                    <strong>Romanized Hinglish &amp; English</strong>
+                  </div>
+                  {audioResult.cleaned && (
+                    <div className={styles.audioResultMetricBadge}>
+                      <span>Cleanup:</span>
+                      <strong style={{ color: '#86EFAC' }}>RNNoise Active</strong>
+                    </div>
+                  )}
+                </div>
+
+                {/* Built-in Audio Player for Listening Along */}
+                {audioSrc && (
+                  <div className={styles.audioPlayerWrap} style={{ marginBottom: 14 }}>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: 6 }}>
+                      🎧 Listen along with audio:
+                    </div>
+                    <audio src={audioSrc} controls className={styles.audioPlayerEl} />
+                  </div>
+                )}
+
+                {/* View Switcher Tabs (SRT vs TXT) */}
+                <div className={styles.audioViewTabsRow}>
+                  <button
+                    type="button"
+                    className={`${styles.audioViewTabBtn} ${audioActiveView === 'srt' ? styles.audioViewTabBtnActive : ''}`}
+                    onClick={() => setAudioActiveView('srt')}
+                  >
+                    <FileText size={14} /> Subtitles (.SRT Format)
+                  </button>
+                  <button
+                    type="button"
+                    className={`${styles.audioViewTabBtn} ${audioActiveView === 'txt' ? styles.audioViewTabBtnActive : ''}`}
+                    onClick={() => setAudioActiveView('txt')}
+                  >
+                    <Type size={14} /> Plain Text Transcript (.TXT)
+                  </button>
+                </div>
+
+                {/* View Content */}
+                {audioActiveView === 'srt' ? (
+                  <div className={styles.audioEditorWrap}>
+                    <textarea
+                      value={audioEditedSrt}
+                      onChange={(e) => setAudioEditedSrt(e.target.value)}
+                      className={styles.audioTextarea}
+                      spellCheck={false}
+                    />
+                    <div className={styles.audioEditorTip}>
+                      <Sparkles size={13} color="#F5B50A" />
+                      <span>You can edit words or timing directly above — edits will automatically be used when downloading or copying!</span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className={styles.audioTranscriptBox}>
+                    {audioResult.transcript || 'No plain transcript available.'}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ═══════════════════════════════════════════════════════════════════
+            TAB 3: PROJECTS / HISTORY
            ═══════════════════════════════════════════════════════════════════ */}
         {activeTab === 'projects' && (
           <div>
