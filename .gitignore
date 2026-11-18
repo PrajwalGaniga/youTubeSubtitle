@@ -40,3 +40,4 @@ yarn-error.log*
 .system_generated/
 scratch/
 *.code-workspace
+testing.py
